@@ -33,6 +33,7 @@ class LookupResponseMsg(AsyncLookupMsg):
 
     lookup_id: str
     num_hit_tokens: int
+    tier_hit_tokens: dict[str, int] = {}
 
     def describe(self) -> str:
         return (

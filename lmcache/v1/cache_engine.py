@@ -105,6 +105,7 @@ class LMCacheEngine:
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
     ):
+        self.lookup_tier_hit_tokens: dict[str, dict[str, int]] = {}
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
         self.metadata = metadata
@@ -981,6 +982,23 @@ class LMCacheEngine:
 
         yield ret_mask
 
+    def _compute_tier_hit_tokens(
+        chunk_info_list: list[tuple[int, int]],
+        block_mapping: dict[str, list[tuple[int, int]]] | None,
+    ) -> dict[str, int]:
+        tier_hit_tokens: dict[str, int] = {}
+        if not block_mapping:
+            return tier_hit_tokens
+        for backend_name, chunk_ranges in block_mapping.items():
+            tok_sum = 0
+            for (l, r) in chunk_ranges:
+                for chunk_idx in range(l, r):
+                    s, e = chunk_info_list[chunk_idx]
+                    tok_sum += (e - s)
+            tier_hit_tokens[backend_name] = tok_sum
+        return tier_hit_tokens
+
+
     @_lmcache_nvtx_annotate
     def lookup(
         self,
@@ -1042,6 +1060,8 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                if lookup_id is not None and lookup_id not in self.lookup_tier_hit_tokens:
+                    self.lookup_tier_hit_tokens[lookup_id] = {}
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1054,6 +1074,13 @@ class LMCacheEngine:
                         search_range,
                         pin,
                     )
+                    tier_hit_tokens = self._compute_tier_hit_tokens(
+                        chunk_info_list, block_mapping
+                    )
+                    if lookup_id is not None:
+                        acc = self.lookup_tier_hit_tokens[lookup_id]
+                        for backend, tok_cnt in tier_hit_tokens.items():
+                            acc[backend] = acc.get(backend, 0) + tok_cnt
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
@@ -1080,6 +1107,9 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
+                tier_hit_tokens = self._compute_tier_hit_tokens(chunk_info_list, block_mapping)
+                if lookup_id is not None:
+                    self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
                 if pin and block_mapping:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"
@@ -1371,6 +1401,7 @@ class LMCacheEngine:
     def lookup_unpin(self, lookup_id: str) -> None:
         if lookup_id in self.lookup_pins:
             assert self.storage_manager is not None
+            self.lookup_tier_hit_tokens.pop(lookup_id, None)
             for location, keys in self.lookup_pins.pop(lookup_id).items():
                 self.storage_manager.batched_unpin(keys, [location])
 

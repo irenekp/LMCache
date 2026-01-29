@@ -83,7 +83,7 @@ class LMCacheLookupClient(LookupClientInterface):
         # the following lookups of the same request must have the
         # same result.
         self.reqs_status: dict[str, int] = {}
-
+        self.reqs_tier_stats: dict[str, dict[str, int]] = {}
         for params in self.socket_params:
             logger.info(
                 "lmcache lookup client connect to rank %s with socket path %s",
@@ -256,9 +256,13 @@ class LMCacheLookupClient(LookupClientInterface):
         self.reqs_status[lookup_id] = num_hit_toks
 
         return num_hit_toks
+    
+    def get_tier_stats(self, lookup_id: str) -> dict[str, int] | None:
+        return self.reqs_tier_stats.get(lookup_id)
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+        self.reqs_tier_stats.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -328,40 +332,59 @@ class LMCacheLookupServer:
                 # ROUTER socket prepends identity frame and empty delimiter
                 # frames[0] = identity, frames[1] = empty delimiter, frames[2:] = data
                 identity = frames[0].bytes
-                # frames[1] is the empty delimiter frame from REQ socket
                 data_frames = frames[2:]
                 if len(data_frames) < 2:
                     logger.warning("Malformed request received: not enough frames.")
                     continue
-                lookup_id = data_frames[-2].bytes.decode("utf-8")
-                request_configs_str = data_frames[-1].bytes.decode("utf-8")
-                request_configs = (
-                    json.loads(request_configs_str) if request_configs_str else None
-                )
-                if not self.enable_blending:
-                    hash_frames = data_frames[0]
-                    offset_frames = data_frames[1]
-                    hashes = self.decoder.decode(hash_frames)
-                    offsets = self.decoder.decode(offset_frames)
-                    result = self.lmcache_engine.lookup(
-                        hashes=hashes,
-                        offsets=offsets,
-                        lookup_id=lookup_id,
-                        pin=True,
-                        request_configs=request_configs,
-                    )
-                else:
-                    token_frames = data_frames[0]
-                    tokens = self.decoder.decode(token_frames)
-                    result = self.lmcache_engine.lookup(
-                        tokens=tokens,
-                        lookup_id=lookup_id,
-                        pin=True,
-                        request_configs=request_configs,
-                    )
-                response = result.to_bytes(4, "big")
-                # ROUTER requires identity frame and empty delimiter for reply
-                self.socket.send_multipart([identity, b"", response])
+                try:
+                    lookup_id = data_frames[-2].bytes.decode("utf-8")
+                    request_configs_str = data_frames[-1].bytes.decode("utf-8")
+                except Exception:
+                    logger.exception("Malformed request received: failed to decode metadata frames.")
+                    continue
+
+                request_configs = json.loads(request_configs_str) if request_configs_str else None
+                payload_frames = data_frames[:-2]
+                try:
+                    if not self.enable_blending:
+                        if len(payload_frames) < 2:
+                            logger.warning("Malformed request received: missing hashes/offsets frames.")
+                            continue
+
+                        hash_frames = payload_frames[0]
+                        offset_frames = payload_frames[1]
+                        hashes = self.decoder.decode(hash_frames)
+                        offsets = self.decoder.decode(offset_frames)
+                        result = self.lmcache_engine.lookup(
+                            hashes=hashes,
+                            offsets=offsets,
+                            lookup_id=lookup_id,
+                            pin=True,
+                            request_configs=request_configs,
+                        )
+                    else:
+                        if len(payload_frames) < 1:
+                            logger.warning("Malformed request received: missing tokens frame.")
+                            continue
+                        token_frames = payload_frames[0]
+                        tokens = self.decoder.decode(token_frames)
+                        result = self.lmcache_engine.lookup(
+                            tokens=tokens,
+                            lookup_id=lookup_id,
+                            pin=True,
+                            request_configs=request_configs,
+                        )
+                except Exception:
+                    logger.exception("Lookup failed for lookup_id=%s", lookup_id)
+                    response = (0).to_bytes(4, "big")
+                    tier_stats_bytes = msgspec.msgpack.encode({})
+                    self.socket.send_multipart([identity, b"", response, tier_stats_bytes])
+                    continue
+                response = int(result).to_bytes(4, "big")
+                tier_stats = self.lmcache_engine.lookup_tier_hit_tokens.get(lookup_id, {})
+                tier_stats_bytes = msgspec.msgpack.encode(tier_stats)
+
+                self.socket.send_multipart([identity, b"", response, tier_stats_bytes])
 
         logger.info("lmcache lookup server start on %s", socket_path)
         self.thread = threading.Thread(

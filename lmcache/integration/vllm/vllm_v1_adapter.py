@@ -65,6 +65,11 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Effective prompt length used for LMCache lookup (after skip_last_n_tokens etc.)    lookup_prompt_len: int
+
+    # True if vLLM forces recomputing last token in the full-hit case.
+    recalc_last_token: bool = False
+    lmcache_tier_hit_tokens: dict[str, int] | None = None
 
 
 @dataclass
@@ -1226,7 +1231,8 @@ class LMCacheConnectorV1Impl:
 
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
-
+        tier_stats = None
+        lookup_prompt_len = None
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
@@ -1236,6 +1242,22 @@ class LMCacheConnectorV1Impl:
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
             )
+            # Compute the effective prompt length used for lookup.
+            # Mirrors the token selection logic in the non-cached lookup path.
+            mm_hashes, mm_positions = extract_mm_features(request)
+            if mm_hashes and mm_positions:
+                base_len = len(request.prompt_token_ids)
+            else:
+                base_len = len(request.all_token_ids)
+
+            lookup_prompt_len = (
+                base_len - self.skip_last_n_tokens
+                if self.skip_last_n_tokens > 0
+                else base_len
+            )
+
+            if hasattr(self.lookup_client, "get_tier_stats"):
+                tier_stats = self.lookup_client.get_tier_stats(req_id)
         else:
             logger.debug(f"Looking up cache for the first time for request {req_id}!")
             self._requests_priority[req_id] = getattr(request, "priority", 0)
@@ -1261,6 +1283,10 @@ class LMCacheConnectorV1Impl:
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+            tier_stats = None
+            if hasattr(self.lookup_client, "get_tier_stats"):
+                tier_stats = self.lookup_client.get_tier_stats(req_id)
+            lookup_prompt_len = len(token_ids)
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1277,13 +1303,15 @@ class LMCacheConnectorV1Impl:
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        assert lookup_prompt_len is not None
+        recalc_last_token = (num_external_hit_tokens == lookup_prompt_len)
+        if recalc_last_token:
             need_to_allocate -= 1
 
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+            "Reqid: %s, Lookup prompt tokens %d, LMCache hit tokens: %d, need to load: %d",
             req_id,
-            request.num_tokens,
+            lookup_prompt_len,
             num_external_hit_tokens,
             need_to_allocate,
         )
@@ -1292,6 +1320,9 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            lookup_prompt_len=lookup_prompt_len,
+            recalc_last_token=recalc_last_token,
+            lmcache_tier_hit_tokens=tier_stats,
         )
 
         if need_to_allocate <= 0:
@@ -1350,14 +1381,7 @@ class LMCacheConnectorV1Impl:
             self.load_specs[request.request_id].can_load = False
             return
 
-        recalc_last = (
-            1
-            if (
-                self.load_specs[request.request_id].lmcache_cached_tokens
-                == request.num_tokens
-            )
-            else 0
-        )
+        recalc_last = 1 if self.load_specs[request.request_id].recalc_last_token else 0
         assert (
             num_external_tokens
             == self.load_specs[request.request_id].lmcache_cached_tokens
@@ -1597,6 +1621,35 @@ class LMCacheConnectorV1Impl:
             return_params = {
                 "first_tok": request._output_token_ids[0],
             }
+
+        gpu_hit_tokens = 0
+        lmcache_by_tier: dict[str, int] = {}
+        total_cache_tokens = 0
+
+        req_id = request.request_id
+        load_spec = self.load_specs.pop(req_id, None)
+        if load_spec is not None:
+            gpu_hit_tokens = int(load_spec.vllm_cached_tokens)
+            if load_spec.lmcache_tier_hit_tokens is not None:
+                lmcache_by_tier = dict(load_spec.lmcache_tier_hit_tokens)
+            recalc_penalty = 1 if load_spec.recalc_last_token else 0
+            if recalc_penalty and lmcache_by_tier:
+                max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
+                lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
+                recalc_penalty = 0
+
+            total_cache_tokens = max(
+                0, gpu_hit_tokens + sum(lmcache_by_tier.values()) - recalc_penalty
+            )
+        if return_params is None:
+            return_params = {}
+        return_params.update(
+            {
+                "gpu_hit_tokens": gpu_hit_tokens,
+                "lmcache_hit_tokens_by_tier": lmcache_by_tier,
+                "total_cache_tokens": total_cache_tokens,
+            }
+        )
 
         return False, return_params
 

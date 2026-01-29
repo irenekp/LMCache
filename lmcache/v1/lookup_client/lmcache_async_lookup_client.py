@@ -55,6 +55,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # this helps us support timeout semantics
         self.first_lookup_time: dict[str, float] = {}
         self.timeout_ms = config.lookup_timeout_ms
+        self.reqs_tier_stats: dict[str, dict[str, int]] = {}
+        self.tier_for_each_worker: dict[str, list[dict[str, int]]] = {}
 
         self.ctx = get_zmq_context(use_asyncio=False)
         kv_connector_extra_config = metadata.kv_connector_extra_config or {}
@@ -227,6 +229,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 msg = msgspec.msgpack.decode(msg_buf, type=LookupResponseMsg)
                 lookup_id = msg.lookup_id
                 res = msg.num_hit_tokens
+                tier_stats = getattr(msg, "tier_hit_tokens", {}) or {}
 
                 with self.lock:
                     if lookup_id not in self.res_for_each_worker:
@@ -234,15 +237,29 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     else:
                         self.res_for_each_worker[lookup_id].append(res)
                     all_res = self.res_for_each_worker[lookup_id]
+                    if lookup_id not in self.tier_for_each_worker:
+                        self.tier_for_each_worker[lookup_id] = [tier_stats]
+                    else:
+                        self.tier_for_each_worker[lookup_id].append(tier_stats)
+                    all_tiers = self.tier_for_each_worker[lookup_id]
+
 
                     if len(all_res) == self.num_ranks:
-                        self.res_for_each_worker.pop(lookup_id)
+                        self.res_for_each_worker.pop(lookup_id, None)
+                        self.tier_for_each_worker.pop(lookup_id, None)
 
-                        # NOTE: it is possible that the number of hit
-                        # tokens is different across (TP and PP) ranks, so we
-                        # can use the minimum value as the number of
-                        # hit tokens.
                         self.reqs_status[lookup_id] = min(all_res)
+
+                        reduced: dict[str, int] = {}
+                        all_keys = set()
+                        for d in all_tiers:
+                            all_keys.update(d.keys())
+
+                        for k in all_keys:
+                            reduced[k] = min(d.get(k, 0) for d in all_tiers)
+
+                        self.reqs_tier_stats[lookup_id] = reduced
+
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)
@@ -250,7 +267,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         with self.lock:
             self.reqs_status.pop(lookup_id, None)
+            self.reqs_tier_stats.pop(lookup_id, None)  # NEW
             self.first_lookup_time.pop(lookup_id, None)
+
+    def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
+        with self.lock:
+            return self.reqs_tier_stats.get(lookup_id)
 
     def cancel_lookup(self, lookup_id: str) -> None:
         """Mark lookup as aborted. Cleanup will happen after task finishes."""
@@ -385,9 +407,11 @@ class LMCacheAsyncLookupServer:
 
     def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
         # Create structured response message
+        tier = self.lmcache_engine.lookup_tier_hit_tokens.get(lookup_id, {})
         msg = LookupResponseMsg(
             lookup_id=lookup_id,
             num_hit_tokens=num_hit_tokens,
+            tier_hit_tokens=tier,
         )
 
         # Serialize message using msgspec
