@@ -1093,32 +1093,54 @@ class LMCacheEngine:
                         continue
                     return res
             else:
-                chunk_info_list = []
-                keys = []
+                chunk_info_list: list[tuple[int, int, CacheEngineKey]] = []
+                keys: list[CacheEngineKey] = []
+
                 for chunk_info in chunk_info_iterator:
                     assert isinstance(chunk_info[2], CacheEngineKey)
-                    start, end, _ = chunk_info
-                    chunk_info_list.append(chunk_info)
-                    # chunk_info contains (start, end, key)
-                    # chunk_info[2] is the key
-                    keys.append(chunk_info[2])
-                # hit chunks by prefix matching
+                    start, end, key = chunk_info
+                    chunk_info_list.append((start, end, key))
+                    keys.append(key)
+
+                # Hit chunks by prefix matching
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
-                tier_hit_tokens = self._compute_tier_hit_tokens_from_block_mapping(chunk_info_list, block_mapping)
+
+                # Tier hit tokens should reflect ONLY the contiguous prefix hit (0..hit_chunks-1).
+                # Your helper needs (start, end) pairs, not full chunk triples.
+                hit_prefix_ranges: list[tuple[int, int]] = [
+                    (s, e) for (s, e, _k) in chunk_info_list[:hit_chunks]
+                ]
+                tier_hit_tokens = self._compute_tier_hit_tokens_from_block_mapping(
+                    hit_prefix_ranges, block_mapping
+                )
+
                 if lookup_id is not None:
                     self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
+
+                # Pin only the keys corresponding to the contiguous prefix hit.
                 if pin and block_mapping:
-                    assert lookup_id is not None, (
-                        "lookup_id is required when pin is True"
-                    )
-                    self.lookup_pins[lookup_id] = block_mapping
-                for idx, (start, end, key) in enumerate(chunk_info_list):
+                    assert lookup_id is not None, "lookup_id is required when pin is True"
+
+                    pinned: dict[str, list[CacheEngineKey]] = {}
+                    idx = 0
+                    for backend, backend_keys in block_mapping.items():
+                        if idx >= hit_chunks:
+                            break
+                        n = len(backend_keys)
+                        take = min(n, hit_chunks - idx)
+                        if take > 0:
+                            pinned[backend] = backend_keys[:take]
+                        idx += n
+
+                    self.lookup_pins[lookup_id] = pinned
+                for idx, (start, end, _key) in enumerate(chunk_info_list):
                     if idx < hit_chunks:
                         res = end
                         continue
                     return res
+                return res
 
             # all tokens where found, return the maximal end
             return res
