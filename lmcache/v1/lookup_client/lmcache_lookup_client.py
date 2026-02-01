@@ -211,7 +211,7 @@ class LMCacheLookupClient(LookupClientInterface):
                 lookup_id_buf,
                 request_configs_buf,
             ]
-
+        tier_results: list[dict[str, int]] = []
         results = []
         failed_rank = -1
         try:
@@ -222,9 +222,22 @@ class LMCacheLookupClient(LookupClientInterface):
             # TODO(Jiayi): we can use zmq poll to optimize a bit
             for i in range(self.num_ranks):
                 failed_rank = i
-                resp = self.sockets[i].recv()
-                result = int.from_bytes(resp, "big")
+                parts = self.sockets[i].recv_multipart(copy=False)
+                if not parts:
+                    results.append(0)
+                    continue
+
+                result = int.from_bytes(parts[0].bytes, "big")
                 results.append(result)
+                if len(parts) >= 2:
+                    try:
+                        tier = msgspec.msgpack.decode(parts[1].bytes, type=dict[str, int])
+                    except Exception:
+                        tier = {}
+                else:
+                    tier = {}
+
+                tier_results.append(tier)
         except zmq.Again as e:
             logger.error(
                 "Timeout occurred for rank %s, recreating all sockets. Error: %s",
@@ -254,6 +267,14 @@ class LMCacheLookupClient(LookupClientInterface):
         # number of hit tokens.
         num_hit_toks = min(results)
         self.reqs_status[lookup_id] = num_hit_toks
+        reduced: dict[str, int] = {}
+        all_keys = set()
+        for d in tier_results:
+            all_keys.update(d.keys())
+        for k in all_keys:
+            reduced[k] = min(d.get(k, 0) for d in tier_results)
+
+        self.reqs_tier_stats[lookup_id] = reduced
 
         return num_hit_toks
     

@@ -982,20 +982,25 @@ class LMCacheEngine:
 
         yield ret_mask
 
-    def _compute_tier_hit_tokens(
-        chunk_info_list: list[tuple[int, int]],
-        block_mapping: dict[str, list[tuple[int, int]]] | None,
+    @staticmethod
+    def _compute_tier_hit_tokens_from_block_mapping(
+        chunk_infos: list[tuple[int, int]],
+        block_mapping: dict[str, list] | None,
     ) -> dict[str, int]:
         tier_hit_tokens: dict[str, int] = {}
         if not block_mapping:
             return tier_hit_tokens
-        for backend_name, chunk_ranges in block_mapping.items():
+
+        idx = 0
+        # NOTE: block_mapping preserves backend iteration order from StorageManager.
+        for backend_name, keys in block_mapping.items():
+            n = len(keys)
             tok_sum = 0
-            for (l, r) in chunk_ranges:
-                for chunk_idx in range(l, r):
-                    s, e = chunk_info_list[chunk_idx]
-                    tok_sum += (e - s)
+            for j in range(idx, min(idx + n, len(chunk_infos))):
+                s, e = chunk_infos[j]
+                tok_sum += (e - s)
             tier_hit_tokens[backend_name] = tok_sum
+            idx += n
         return tier_hit_tokens
 
 
@@ -1060,7 +1065,7 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                if lookup_id is not None and lookup_id not in self.lookup_tier_hit_tokens:
+                if lookup_id is not None:
                     self.lookup_tier_hit_tokens[lookup_id] = {}
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
@@ -1074,22 +1079,16 @@ class LMCacheEngine:
                         search_range,
                         pin,
                     )
-                    tier_hit_tokens = self._compute_tier_hit_tokens(
-                        chunk_info_list, block_mapping
-                    )
-                    if lookup_id is not None:
-                        acc = self.lookup_tier_hit_tokens[lookup_id]
-                        for backend, tok_cnt in tier_hit_tokens.items():
-                            acc[backend] = acc.get(backend, 0) + tok_cnt
-                    # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                        backend = next(iter(block_mapping.keys()))
+
+                        if lookup_id is not None:
+                            acc = self.lookup_tier_hit_tokens[lookup_id]
+                            acc[backend] = acc.get(backend, 0) + (end - start)
                         if pin:
-                            assert lookup_id is not None, (
-                                "lookup_id is required when pin is True"
-                            )
+                            assert lookup_id is not None, "lookup_id is required when pin is True"
+                            self.lookup_pins[lookup_id][backend].extend(key_all_layers)
                             location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
                         continue
                     return res
@@ -1107,7 +1106,7 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
-                tier_hit_tokens = self._compute_tier_hit_tokens(chunk_info_list, block_mapping)
+                tier_hit_tokens = self._compute_tier_hit_tokens_from_block_mapping(chunk_info_list, block_mapping)
                 if lookup_id is not None:
                     self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
                 if pin and block_mapping:

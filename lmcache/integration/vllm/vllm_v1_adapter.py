@@ -65,7 +65,8 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
-    # Effective prompt length used for LMCache lookup (after skip_last_n_tokens etc.)    lookup_prompt_len: int
+    # Effective prompt length used for LMCache lookup (after skip_last_n_tokens etc.)    
+    lookup_prompt_len: int
 
     # True if vLLM forces recomputing last token in the full-hit case.
     recalc_last_token: bool = False
