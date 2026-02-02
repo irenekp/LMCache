@@ -1325,6 +1325,20 @@ class LMCacheConnectorV1Impl:
             recalc_last_token=recalc_last_token,
             lmcache_tier_hit_tokens=tier_stats,
         )
+        try:
+            kv_params = getattr(request, "kv_transfer_params", None)
+            if kv_params is None:
+                kv_params = {}
+                setattr(request, "kv_transfer_params", kv_params)
+            kv_params["_lmcache_telemetry"] = {
+                "vllm_cached_tokens": int(num_computed_tokens),
+                "lmcache_cached_tokens": int(num_external_hit_tokens),
+                "lookup_prompt_len": int(lookup_prompt_len) if lookup_prompt_len is not None else None,
+                "recalc_last_token": bool(recalc_last_token),
+                "lmcache_tier_hit_tokens": dict(tier_stats) if tier_stats is not None else None,
+            }
+        except Exception:
+            logger.exception("Failed to attach _lmcache_telemetry to request.")
 
         if need_to_allocate <= 0:
             return 0
@@ -1628,20 +1642,44 @@ class LMCacheConnectorV1Impl:
         total_cache_tokens = 0
 
         req_id = request.request_id
+
+        if req_id not in self.load_specs:
+            logger.warning(
+                "[telemetry] load_spec missing for req_id=%s. "
+                "known_keys(sample)=%s. "
+                "request has attrs: %s",
+                req_id,
+                list(self.load_specs.keys())[:5],
+                {k: getattr(request, k) for k in ["request_id", "request_uuid", "engine_request_id", "seq_id"] if hasattr(request, k)},
+            )
         load_spec = self.load_specs.pop(req_id, None)
+        telemetry = None
+        kv_params = getattr(request, "kv_transfer_params", None)
+        if isinstance(kv_params, dict):
+            telemetry = kv_params.get("_lmcache_telemetry")
+
         if load_spec is not None:
             gpu_hit_tokens = int(load_spec.vllm_cached_tokens)
             if load_spec.lmcache_tier_hit_tokens is not None:
                 lmcache_by_tier = dict(load_spec.lmcache_tier_hit_tokens)
-            recalc_penalty = 1 if load_spec.recalc_last_token else 0
-            if recalc_penalty and lmcache_by_tier:
+            if load_spec.recalc_last_token and lmcache_by_tier:
                 max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
                 lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
-                recalc_penalty = 0
+            total_cache_tokens = gpu_hit_tokens + sum(lmcache_by_tier.values())
 
-            total_cache_tokens = max(
-                0, gpu_hit_tokens + sum(lmcache_by_tier.values()) - recalc_penalty
-            )
+        elif isinstance(telemetry, dict):
+            gpu_hit_tokens = int(telemetry.get("vllm_cached_tokens", 0) or 0)
+
+            tier = telemetry.get("lmcache_tier_hit_tokens")
+            if isinstance(tier, dict):
+                lmcache_by_tier = dict(tier)
+
+            if telemetry.get("recalc_last_token", False) and lmcache_by_tier:
+                max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
+                lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
+
+            total_cache_tokens = gpu_hit_tokens + sum(lmcache_by_tier.values())
+
         if return_params is None:
             return_params = {}
         return_params.update(
@@ -1651,6 +1689,8 @@ class LMCacheConnectorV1Impl:
                 "total_cache_tokens": total_cache_tokens,
             }
         )
+        if isinstance(getattr(request, "kv_transfer_params", None), dict):
+            request.kv_transfer_params.pop("_lmcache_telemetry", None)
 
         return False, return_params
 
