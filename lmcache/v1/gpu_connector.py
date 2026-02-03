@@ -1264,8 +1264,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
-
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        :raises ValueError: If 'slot_mapping' or 'sync' is not provided in kwargs.
         """
         self._maybe_update_timing_sink(**kwargs)
 
@@ -1311,30 +1310,42 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
-        if sync:
-            if self._timing_sink is not None:
-                stall_start = torch.cuda.Event(enable_timing=True)
-                stall_end = torch.cuda.Event(enable_timing=True)
-                stall_start.record(current_stream)
-                current_stream.wait_stream(self.load_stream)
-                stall_end.record(current_stream)
-                self._timing_sink.record_stall_interval(stall_start, stall_end)
-            else:
-                current_stream.wait_stream(self.load_stream)
+
+            if sync:
+                if self._timing_sink is not None:
+                    stall_start = torch.cuda.Event(enable_timing=True)
+                    stall_end = torch.cuda.Event(enable_timing=True)
+                    stall_start.record(current_stream)
+                    current_stream.wait_stream(self.load_stream)
+                    stall_end.record(current_stream)
+                    self._timing_sink.record_stall_interval(stall_start, stall_end)
+                else:
+                    current_stream.wait_stream(self.load_stream)
 
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                emit_copy = False
+                if (self._timing_sink is not None) and self.use_gpu:
+                    for mo in memory_objs_layer:
+                        t = getattr(mo, "tensor", None)
+                        if t is None:
+                            t = getattr(mo, "raw_tensor", None)
+                        if t is not None and (not t.is_cuda):
+                            emit_copy = True
+                            break
+
+                    copy_start = torch.cuda.Event(enable_timing=True) if emit_copy else None
+                    if copy_start is not None:
+                        copy_start.record(self.load_stream)
+                else:
+                    copy_start = None
+
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
-                    copy_start = None
-                    if self._timing_sink is not None:
-                        copy_start = torch.cuda.Event(enable_timing=True)
-                        copy_start.record(self.load_stream)
-
                     # Validate memory format
                     if self.use_mla:
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
@@ -1346,11 +1357,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             f"Expected memory format {MemoryFormat.KV_T2D}, "
                             f"got {memory_obj.metadata.fmt}"
                         )
+
                     if self.use_gpu:
+                        assert memory_obj.tensor is not None
                         tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
                             memory_obj.tensor, non_blocking=True
                         )
                     else:
+                        assert memory_obj.tensor is not None
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
                             self.kvcaches[layer_id],
