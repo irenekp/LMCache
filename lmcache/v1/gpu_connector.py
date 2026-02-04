@@ -24,12 +24,22 @@ logger = init_logger(__name__)
 
 class GPUConnectorTimingSink(metaclass=abc.ABCMeta):
     @abc.abstractmethod
-    def record_copy_interval(self, start_ev: "torch.cuda.Event", end_ev: "torch.cuda.Event") -> None:
+    def record_copy_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
         """Host/CPU -> GPU restore copy interval (load_stream)."""
         raise NotImplementedError
 
     @abc.abstractmethod
-    def record_stall_interval(self, start_ev: "torch.cuda.Event", end_ev: "torch.cuda.Event") -> None:
+    def record_stall_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
         """Compute-stream stall interval caused by waiting on load_stream."""
         raise NotImplementedError
 
@@ -1312,36 +1322,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             memory_objs_layer = yield
 
             if sync:
-                if self._timing_sink is not None:
+                if self._timing_sink is not None and layer_id > 0:
                     stall_start = torch.cuda.Event(enable_timing=True)
                     stall_end = torch.cuda.Event(enable_timing=True)
                     stall_start.record(current_stream)
                     current_stream.wait_stream(self.load_stream)
                     stall_end.record(current_stream)
-                    self._timing_sink.record_stall_interval(stall_start, stall_end)
+                    self._timing_sink.record_stall_interval(
+                        stall_start, stall_end, layer_id=layer_id - 1
+                    )
                 else:
                     current_stream.wait_stream(self.load_stream)
 
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
-                emit_copy = False
-                if (self._timing_sink is not None) and self.use_gpu:
-                    for mo in memory_objs_layer:
-                        t = getattr(mo, "tensor", None)
-                        if t is None:
-                            t = getattr(mo, "raw_tensor", None)
-                        if t is not None and (not t.is_cuda):
-                            emit_copy = True
-                            break
-
-                    copy_start = torch.cuda.Event(enable_timing=True) if emit_copy else None
-                    if copy_start is not None:
-                        copy_start.record(self.load_stream)
-                else:
-                    copy_start = None
+                copy_start = None
+                if self._timing_sink is not None:
+                    copy_start = torch.cuda.Event(enable_timing=True)
+                    copy_start.record(self.load_stream)
 
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
@@ -1374,10 +1373,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             self.vllm_two_major,
                             self.use_mla,
                         )
-                if copy_start is not None:
-                    copy_end = torch.cuda.Event(enable_timing=True)
-                    copy_end.record(self.load_stream)
-                    self._timing_sink.record_copy_interval(copy_start, copy_end)
 
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
@@ -1389,17 +1384,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.vllm_two_major,
                         self.use_mla,
                     )
+
+                if copy_start is not None:
+                    copy_end = torch.cuda.Event(enable_timing=True)
+                    copy_end.record(self.load_stream)
+                    self._timing_sink.record_copy_interval(copy_start, copy_end)
+
         yield
 
         # synchronize the last layer
         if sync:
-            if self._timing_sink is not None:
+            if self._timing_sink is not None and self.num_layers > 0:
                 stall_start = torch.cuda.Event(enable_timing=True)
                 stall_end = torch.cuda.Event(enable_timing=True)
                 stall_start.record(current_stream)
                 current_stream.wait_stream(self.load_stream)
                 stall_end.record(current_stream)
-                self._timing_sink.record_stall_interval(stall_start, stall_end)
+                self._timing_sink.record_stall_interval(
+                    stall_start, stall_end, layer_id=self.num_layers - 1
+                )
             else:
                 current_stream.wait_stream(self.load_stream)
 
