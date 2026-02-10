@@ -10,7 +10,12 @@ import time
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
 from lmcache.v1.memory_management import MemoryObj
@@ -78,6 +83,7 @@ class RemoteBackend(StorageBackendInterface):
         # we must make decision (whether to send or not) at the local side
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.kv_event_sink = None
 
         # NOTE: Health monitoring is now handled at the LMCacheEngine level
         # through HealthMonitor. RemoteBackend no longer manages its own
@@ -566,7 +572,18 @@ class RemoteBackend(StorageBackendInterface):
             return False
 
         try:
-            return self.connection.remove_sync(key)
+            removed = self.connection.remove_sync(key)
+            if removed and self.kv_event_sink is not None:
+                if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                    return removed
+                self.kv_event_sink(
+                    CacheEvictEvent(
+                        block_hashes=[key.chunk_hash],
+                        block_size=int(self.config.chunk_size),
+                        medium=str(self),
+                    )
+                )
+            return removed
         except Exception as e:
             logger.exception(
                 f"Failed to remove key {key} from remote backend, error: {e}"

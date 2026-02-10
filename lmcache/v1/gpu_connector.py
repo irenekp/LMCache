@@ -467,7 +467,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 copy_end.record(self.load_stream)
 
         if emit_copy and copy_start is not None and copy_end is not None:
-            self._timing_sink.record_copy_interval(copy_start, copy_end, layer_id=layer_id)
+            self._timing_sink.record_copy_interval(copy_start, copy_end)
 
         self.load_stream.synchronize()
 

@@ -14,7 +14,13 @@ import torch
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    DiskCacheMetadata,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -153,6 +159,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self.kv_event_sink = None
 
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -255,6 +262,17 @@ class LocalDiskBackend(StorageBackendInterface):
             self.batched_msg_sender.add_kv_op(
                 op_type=OpType.EVICT,
                 key=key.chunk_hash,
+            )
+
+        if self.kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            self.kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(self.config.chunk_size),
+                    medium=str(self),
+                )
             )
 
         return True

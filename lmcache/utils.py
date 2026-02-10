@@ -598,6 +598,15 @@ class CacheStoreEvent:
     lora_name: str | None
 
 
+@dataclass
+class CacheEvictEvent:
+    """Represents a cache eviction for a KV chunk."""
+
+    block_hashes: list[int]
+    block_size: int
+    medium: str | None
+
+
 ##### NVTX annotation #####
 _NVTX_COLORS = ["green", "blue", "purple", "rapids"]
 

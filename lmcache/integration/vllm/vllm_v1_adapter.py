@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import threading
 import os
 
 # Third Party
@@ -35,11 +36,12 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
+from lmcache.utils import CacheEvictEvent, CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.gpu_connector import GPUConnectorTimingSink
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -55,6 +57,15 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+
+def _split_tier_stats(tier_stats: Any) -> dict[str, int]:
+    if not isinstance(tier_stats, dict):
+        return {}
+    min_payload = tier_stats.get("min")
+    if isinstance(min_payload, dict):
+        return dict(min_payload)
+    return dict(tier_stats)
 
 
 @dataclass
@@ -121,6 +132,8 @@ class RequestTracker:
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
+    # The vLLM block hashes corresponding to full blocks.
+    block_hashes: list[Any] = field(default_factory=list)
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -194,6 +207,7 @@ class RequestTracker:
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            block_hashes=list(new_request.block_hashes or []),
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -284,6 +298,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # vLLM block hashes aligned with chunk indices (full blocks only)
+    block_hashes: Optional[list[Any]] = None
 
     @staticmethod
     def from_request_tracker(
@@ -419,6 +435,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            block_hashes=tracker.block_hashes,
         )
 
 
@@ -515,6 +532,7 @@ class LMCacheConnectorV1Impl:
         ] = []
         self.layerwise_storers: list[Generator[Optional[torch.Tensor], None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self._timing_sink: Optional[GPUConnectorTimingSink] = None
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -566,6 +584,10 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        # Map LMCache chunk hash -> vLLM block hash for duplication tracking.
+        self._hash_translation: dict[int, Any] = {}
+        self._hash_translation_sizes: dict[int, int] = {}
+        self._hash_translation_lock = threading.Lock()
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -588,6 +610,51 @@ class LMCacheConnectorV1Impl:
                 "features may not work, such as DSA"
             )
             self._manager.post_init()
+
+    def _record_hash_translation(
+        self,
+        token_ids: list[int],
+        store_mask: torch.Tensor,
+        block_hashes: Optional[list[Any]],
+        request_configs: Optional[dict],
+    ) -> None:
+        if self.lmcache_engine is None or not block_hashes:
+            return
+        token_database = getattr(self.lmcache_engine, "token_database", None)
+        if token_database is None:
+            return
+        try:
+            entries = token_database.process_tokens(
+                tokens=token_ids,
+                mask=store_mask,
+                make_key=False,
+                request_configs=request_configs,
+            )
+        except Exception as exc:
+            logger.debug("Failed to build hash translation table: %s", exc)
+            return
+
+        with self._hash_translation_lock:
+            for start, end, lm_hash in entries:
+                block_idx = start // self._lmcache_chunk_size
+                if block_idx >= len(block_hashes):
+                    continue
+                self._hash_translation[lm_hash] = block_hashes[block_idx]
+                self._hash_translation_sizes[lm_hash] = end - start
+
+    def _translate_kv_hashes(self, hashes: list[Any]) -> list[Any]:
+        if not hashes:
+            return []
+        with self._hash_translation_lock:
+            return [self._hash_translation.get(h, h) for h in hashes]
+
+    def _evict_hash_translation(self, hashes: list[Any]) -> None:
+        if not hashes:
+            return
+        with self._hash_translation_lock:
+            for h in hashes:
+                self._hash_translation.pop(h, None)
+                self._hash_translation_sizes.pop(h, None)
 
     # ==================== Property Accessors ====================
 
@@ -1049,6 +1116,13 @@ class LMCacheConnectorV1Impl:
                     request.req_id,
                 )
 
+                self._record_hash_translation(
+                    token_ids=token_ids,
+                    store_mask=store_mask,
+                    block_hashes=request.block_hashes,
+                    request_configs=request.request_configs,
+                )
+
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
                 layerwise_storer = self.lmcache_engine.store_layer(
@@ -1081,12 +1155,21 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            if not self.layerwise_storers:
+                return
             for layerwise_storer in self.layerwise_storers:
-                next(layerwise_storer)
+                try:
+                    next(layerwise_storer)
+                except StopIteration:
+                    # Generator already exhausted; treat as done.
+                    continue
 
             # unpin the kv caches according to req_id
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            # Clear per-step state so decode-only steps don't reuse exhausted generators.
+            self.layerwise_storers = []
+            self.current_layer = 0
             return
 
         assert len(self.kv_caches) > 0
@@ -1154,6 +1237,13 @@ class LMCacheConnectorV1Impl:
                     token_ids = token_ids[:aligned_token_len]
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
+
+            self._record_hash_translation(
+                token_ids=token_ids,
+                store_mask=store_mask,
+                block_hashes=request.block_hashes,
+                request_configs=request.request_configs,
+            )
 
             self.lmcache_engine.store(
                 token_ids,
@@ -1233,6 +1323,7 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
         tier_stats = None
+        tier_min: dict[str, int] = {}
         lookup_prompt_len = None
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
@@ -1259,6 +1350,7 @@ class LMCacheConnectorV1Impl:
 
             if hasattr(self.lookup_client, "get_tier_stats"):
                 tier_stats = self.lookup_client.get_tier_stats(req_id)
+                tier_min = _split_tier_stats(tier_stats)
         else:
             logger.debug(f"Looking up cache for the first time for request {req_id}!")
             self._requests_priority[req_id] = getattr(request, "priority", 0)
@@ -1287,6 +1379,7 @@ class LMCacheConnectorV1Impl:
             tier_stats = None
             if hasattr(self.lookup_client, "get_tier_stats"):
                 tier_stats = self.lookup_client.get_tier_stats(req_id)
+                tier_min = _split_tier_stats(tier_stats)
             lookup_prompt_len = len(token_ids)
 
         if num_external_hit_tokens is None:
@@ -1323,7 +1416,7 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             lookup_prompt_len=lookup_prompt_len,
             recalc_last_token=recalc_last_token,
-            lmcache_tier_hit_tokens=tier_stats,
+            lmcache_tier_hit_tokens=tier_min or None,
         )
         try:
             kv_params = getattr(request, "kv_transfer_params", None)
@@ -1335,7 +1428,7 @@ class LMCacheConnectorV1Impl:
                 "lmcache_cached_tokens": int(num_external_hit_tokens),
                 "lookup_prompt_len": int(lookup_prompt_len) if lookup_prompt_len is not None else None,
                 "recalc_last_token": bool(recalc_last_token),
-                "lmcache_tier_hit_tokens": dict(tier_stats) if tier_stats is not None else None,
+                "lmcache_tier_hit_tokens": dict(tier_min) if tier_min else None,
             }
         except Exception:
             logger.exception("Failed to attach _lmcache_telemetry to request.")
@@ -1670,9 +1763,9 @@ class LMCacheConnectorV1Impl:
         elif isinstance(telemetry, dict):
             gpu_hit_tokens = int(telemetry.get("vllm_cached_tokens", 0) or 0)
 
-            tier = telemetry.get("lmcache_tier_hit_tokens")
-            if isinstance(tier, dict):
-                lmcache_by_tier = dict(tier)
+            tier_min = telemetry.get("lmcache_tier_hit_tokens")
+            if isinstance(tier_min, dict):
+                lmcache_by_tier = dict(tier_min)
 
             if telemetry.get("recalc_last_token", False) and lmcache_by_tier:
                 max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
@@ -1695,7 +1788,51 @@ class LMCacheConnectorV1Impl:
         return False, return_params
 
     @_lmcache_nvtx_annotate
-    def get_kv_events(self) -> Iterable[CacheStoreEvent]:
-        if self.lmcache_engine is not None:
-            return self.lmcache_engine.get_kv_events()
-        return []
+    def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheEvictEvent]:
+        if self.lmcache_engine is None:
+            return []
+        events = self.lmcache_engine.get_kv_events()
+        if not events:
+            return []
+        translated: list[CacheStoreEvent | CacheEvictEvent] = []
+        for event in events:
+            if hasattr(event, "parent_block_hash"):
+                parent_hash = event.parent_block_hash
+                if parent_hash is not None:
+                    parent_hash = self._translate_kv_hashes([parent_hash])[0]
+                translated.append(
+                    CacheStoreEvent(
+                        block_hashes=self._translate_kv_hashes(event.block_hashes),
+                        parent_block_hash=parent_hash,
+                        token_ids=event.token_ids,
+                        block_size=event.block_size,
+                        lora_id=getattr(event, "lora_id", None),
+                        medium=event.medium,
+                        lora_name=getattr(event, "lora_name", None),
+                    )
+                )
+            else:
+                translated.append(
+                    CacheEvictEvent(
+                        block_hashes=self._translate_kv_hashes(event.block_hashes),
+                        block_size=event.block_size,
+                        medium=event.medium,
+                    )
+                )
+                self._evict_hash_translation(event.block_hashes)
+        return translated
+
+    def get_timing_sink(self) -> Optional[GPUConnectorTimingSink]:
+        return self._timing_sink
+
+    def set_timing_sink(self, sink: Optional[GPUConnectorTimingSink]) -> None:
+        self._timing_sink = sink
+        if getattr(self, "lmcache_engine", None) is None:
+            return
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        if gpu_connector is None:
+            return
+        if hasattr(gpu_connector, "set_timing_sink"):
+            gpu_connector.set_timing_sink(sink)
+        else:
+            setattr(gpu_connector, "_timing_sink", sink)

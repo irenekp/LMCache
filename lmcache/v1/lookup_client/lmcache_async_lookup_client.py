@@ -250,15 +250,16 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
                         self.reqs_status[lookup_id] = min(all_res)
 
-                        reduced: dict[str, int] = {}
+                        min_by: dict[str, int] = {}
                         all_keys = set()
                         for d in all_tiers:
                             all_keys.update(d.keys())
 
                         for k in all_keys:
-                            reduced[k] = min(d.get(k, 0) for d in all_tiers)
+                            vals = [d.get(k, 0) for d in all_tiers]
+                            min_by[k] = min(vals) if vals else 0
 
-                        self.reqs_tier_stats[lookup_id] = reduced
+                        self.reqs_tier_stats[lookup_id] = min_by
 
 
             except Exception as e:

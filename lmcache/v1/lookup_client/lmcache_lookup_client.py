@@ -267,14 +267,15 @@ class LMCacheLookupClient(LookupClientInterface):
         # number of hit tokens.
         num_hit_toks = min(results)
         self.reqs_status[lookup_id] = num_hit_toks
-        reduced: dict[str, int] = {}
+        min_by: dict[str, int] = {}
         all_keys = set()
         for d in tier_results:
             all_keys.update(d.keys())
         for k in all_keys:
-            reduced[k] = min(d.get(k, 0) for d in tier_results)
+            vals = [d.get(k, 0) for d in tier_results]
+            min_by[k] = min(vals) if vals else 0
 
-        self.reqs_tier_stats[lookup_id] = reduced
+        self.reqs_tier_stats[lookup_id] = min_by
 
         return num_hit_toks
     

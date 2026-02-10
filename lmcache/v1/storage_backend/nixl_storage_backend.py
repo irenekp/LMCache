@@ -37,7 +37,7 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, CacheEvictEvent, LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -905,6 +905,17 @@ class NixlStaticStorageBackend(NixlStorageBackend):
                 self.cache_policy.update_on_force_evict(key)
 
         self.pool.push(metadata.index)
+        kv_event_sink = getattr(self, "kv_event_sink", None)
+        if kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(self.config.chunk_size),
+                    medium=str(self),
+                )
+            )
         return True
 
     def pin(self, key: CacheEngineKey) -> bool:
@@ -1370,6 +1381,17 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         :param force: Whether to force removal (not used in this implementation)
         """
         self._cache_discard(key.chunk_hash)
+        kv_event_sink = getattr(self, "kv_event_sink", None)
+        if kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(self.config.chunk_size),
+                    medium=str(self),
+                )
+            )
         return True
 
     def pin(self, key: CacheEngineKey) -> bool:

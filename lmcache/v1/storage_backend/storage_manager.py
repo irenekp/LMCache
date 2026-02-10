@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -28,6 +29,9 @@ from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
     CacheEngineKey,
+    CacheEvictEvent,
+    CacheStoreEvent,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     start_loop_in_thread_with_exceptions,
 )
@@ -224,6 +228,9 @@ class StorageManager:
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
+        kv_event_sink: Optional[
+            Callable[[CacheStoreEvent | CacheEvictEvent], None]
+        ] = None,
     ):
         self.config = config
         self.metadata = metadata
@@ -250,6 +257,9 @@ class StorageManager:
                 lmcache_worker,
             )
         )
+        if kv_event_sink is not None:
+            for backend in self.storage_backends.values():
+                setattr(backend, "kv_event_sink", kv_event_sink)
 
         # the backend used for actual storage
         self.non_allocator_backends = self.get_non_allocator_backends()
@@ -269,6 +279,7 @@ class StorageManager:
         self.worker_id = metadata.worker_id
 
         self.event_manager = event_manager
+        self.kv_event_sink = kv_event_sink
 
         self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = (
             async_lookup_server
@@ -430,7 +441,49 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+
+            on_complete_callback = None
+            if self.kv_event_sink is not None:
+                key_to_tokens: dict[CacheEngineKey, int] = {
+                    k: int(m.get_num_tokens())
+                    for k, m in zip(ks, objs, strict=False)
+                }
+
+                def _make_store_cb(
+                    backend_label: str,
+                    token_map: dict[CacheEngineKey, int],
+                    sink: Callable[[CacheStoreEvent | CacheEvictEvent], None],
+                ):
+                    def _cb(key: CacheEngineKey) -> None:
+                        if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                            return
+                        num_tokens = token_map.get(key)
+                        if num_tokens is None:
+                            return
+                        sink(
+                            CacheStoreEvent(
+                                block_hashes=[key.chunk_hash],
+                                parent_block_hash=None,
+                                token_ids=[],
+                                block_size=num_tokens,
+                                lora_id=None,
+                                medium=backend_label,
+                                lora_name=None,
+                            )
+                        )
+
+                    return _cb
+
+                on_complete_callback = _make_store_cb(
+                    backend_name, key_to_tokens, self.kv_event_sink
+                )
+
+            backend.batched_submit_put_task(
+                ks,
+                objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

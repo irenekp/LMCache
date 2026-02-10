@@ -13,7 +13,12 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -73,6 +78,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.cpu_lock = threading.Lock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.kv_event_sink = None
 
         self.layerwise = config.use_layerwise
         self.enable_blending = config.enable_blending
@@ -271,6 +277,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
         memory_obj = self.hot_cache.pop(key)
+        num_tokens = memory_obj.get_num_tokens()
         memory_obj.ref_count_down()
 
         if force:
@@ -281,6 +288,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
             self.batched_msg_sender.add_kv_op(
                 op_type=OpType.EVICT,
                 key=key.chunk_hash,
+            )
+        if self.kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            self.kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(num_tokens),
+                    medium=str(self),
+                )
             )
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because
@@ -585,6 +602,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # Accurate estimation is hard due to fragmentation
                 num_candidates = 1
                 evict_keys = None
+                pending_evictions: list[tuple[CacheEngineKey, int]] = []
                 with self.cpu_lock:
                     evict_keys = self.cache_policy.get_evict_candidates(
                         self.hot_cache, num_candidates=num_candidates
@@ -614,9 +632,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             logger.debug(
                                 f"Evicting {len(old_mem_objs)} chunks from cpu memory"
                             )
+                            if old_mem_objs:
+                                pending_evictions.append(
+                                    (
+                                        evict_key_all_layer[0],
+                                        old_mem_objs[0].get_num_tokens(),
+                                    )
+                                )
                     else:
                         self.stats_monitor.update_local_cpu_evict_failed_count(
                             num_candidates
+                        )
+                if self.kv_event_sink is not None:
+                    for evict_key, num_tokens in pending_evictions:
+                        if (
+                            isinstance(evict_key, LayerCacheEngineKey)
+                            and evict_key.layer_id != 0
+                        ):
+                            continue
+                        self.kv_event_sink(
+                            CacheEvictEvent(
+                                block_hashes=[evict_key.chunk_hash],
+                                block_size=int(num_tokens),
+                                medium=str(self),
+                            )
                         )
 
             if wait_other_requests:

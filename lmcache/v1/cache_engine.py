@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import threading
 import time
 
 # Third Party
@@ -34,6 +35,7 @@ from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
+    CacheEvictEvent,
     CacheStoreEvent,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
@@ -174,9 +176,11 @@ class LMCacheEngine:
         self.kv_events_enabled = False
         self.kv_events_enabled = config.enable_kv_events
         if self.kv_events_enabled:
-            self.kv_events: List[CacheStoreEvent] = []
+            self.kv_events: List[CacheStoreEvent | CacheEvictEvent] = []
+            self._kv_events_lock = threading.Lock()
             logger.info("KV events are enabled.")
         else:
+            self._kv_events_lock = None
             logger.info("KV events are disabled.")
 
         # HACK: remove this in the future
@@ -211,6 +215,8 @@ class LMCacheEngine:
         PinMonitor.GetOrCreate(config)
 
         self.post_inited = False
+        # When True, store events are emitted by storage backends via callbacks.
+        self._backend_kv_events_enabled = False
 
         # Whether to force store to wait if no CPU buffer is available
         self.force_store_wait = config.extra_config and config.extra_config.get(
@@ -279,8 +285,22 @@ class LMCacheEngine:
                     event_manager=self.event_manager,
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
+                    kv_event_sink=self._append_kv_event
+                    if self.kv_events_enabled
+                    else None,
                 )
+                if self.kv_events_enabled:
+                    # Prefer backend-specific events to avoid double counting.
+                    self._backend_kv_events_enabled = True
             self.post_inited = True
+
+    def _append_kv_event(self, event: CacheStoreEvent | CacheEvictEvent) -> None:
+        if not self.kv_events_enabled:
+            return
+        if self._kv_events_lock is None:
+            return
+        with self._kv_events_lock:
+            self.kv_events.append(event)
 
     def freeze(self, enabled: bool) -> None:
         """
@@ -442,7 +462,7 @@ class LMCacheEngine:
                 tot_token_num += num_tokens
 
                 # Create KV event
-                if self.kv_events_enabled:
+                if self.kv_events_enabled and not self._backend_kv_events_enabled:
                     stored_event = CacheStoreEvent(
                         block_hashes=[key.chunk_hash],
                         parent_block_hash=None if start == 0 else prev_key,
@@ -468,7 +488,7 @@ class LMCacheEngine:
                             % stored_event
                         )
                     )
-                    self.kv_events.append(stored_event)
+                    self._append_kv_event(stored_event)
                     prev_key = key.chunk_hash
 
         # memory_objs might be empty, directly return to avoid sending tokens
@@ -616,7 +636,11 @@ class LMCacheEngine:
             tot_token_num += num_tokens
 
             # Create KV event
-            if self.kv_events_enabled and tokens is not None:
+            if (
+                self.kv_events_enabled
+                and tokens is not None
+                and not self._backend_kv_events_enabled
+            ):
                 stored_event = CacheStoreEvent(
                     block_hashes=[key.chunk_hash],
                     parent_block_hash=None if start == 0 else prev_key,
@@ -637,7 +661,7 @@ class LMCacheEngine:
                 logger.debug(
                     f"Added kv cache event '{stored_event}' to kv cache events queue"
                 )
-                self.kv_events.append(stored_event)
+                self._append_kv_event(stored_event)
                 prev_key = key.chunk_hash
 
         if keys:
@@ -1443,8 +1467,15 @@ class LMCacheEngine:
         return self._clear(tokens, locations, request_configs)
 
     @_lmcache_nvtx_annotate
-    def get_kv_events(self) -> Iterable[CacheStoreEvent]:
-        if self.kv_events_enabled and (events := self.kv_events):
+    def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheEvictEvent]:
+        if not self.kv_events_enabled:
+            return []
+        if self._kv_events_lock is None:
+            return []
+        with self._kv_events_lock:
+            if not self.kv_events:
+                return []
+            events = self.kv_events
             self.kv_events = []
             return events
         return []

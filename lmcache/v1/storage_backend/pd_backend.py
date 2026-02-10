@@ -18,6 +18,8 @@ from lmcache.utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     TORCH_DTYPE_TO_STR_DTYPE,
     CacheEngineKey,
+    CacheEvictEvent,
+    LayerCacheEngineKey,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -145,6 +147,7 @@ class PDBackend(AllocatorBackendInterface):
         config: LMCacheEngineConfig,
         metadata: LMCacheEngineMetadata,
     ):
+        self.config = config
         self.running = True
 
         self.tp_rank = metadata.worker_id
@@ -573,6 +576,17 @@ class PDBackend(AllocatorBackendInterface):
             if mem_obj := self.data.get(key, None):
                 if mem_obj.get_ref_count() == 1:
                     del self.data[key]
+                    kv_event_sink = getattr(self, "kv_event_sink", None)
+                    if kv_event_sink is not None:
+                        if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                            return True
+                        kv_event_sink(
+                            CacheEvictEvent(
+                                block_hashes=[key.chunk_hash],
+                                block_size=int(self.config.chunk_size),
+                                medium=str(self),
+                            )
+                        )
                 return True
             return False
 
