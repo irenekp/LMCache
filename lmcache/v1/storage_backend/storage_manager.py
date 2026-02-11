@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Generator,
     List,
@@ -23,6 +24,9 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import (
     CacheEngineKey,
+    CacheEvictEvent,
+    CacheStoreEvent,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     start_loop_in_thread_with_exceptions,
 )
@@ -183,6 +187,9 @@ class StorageManager:
         metadata: LMCacheEngineMetadata,
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
+        kv_event_sink: Optional[
+            Callable[[CacheStoreEvent | CacheEvictEvent], None]
+        ] = None,
     ):
         self.config = config
         self.metadata = metadata
@@ -208,6 +215,9 @@ class StorageManager:
                 lmcache_worker,
             )
         )
+        if kv_event_sink is not None:
+            for backend in self.storage_backends.values():
+                setattr(backend, "kv_event_sink", kv_event_sink)
 
         self.enable_pd = config.enable_pd
 
@@ -222,6 +232,7 @@ class StorageManager:
         self.worker_id = metadata.worker_id
 
         self.event_manager = event_manager
+        self.kv_event_sink = kv_event_sink
 
         self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None
 
@@ -348,7 +359,48 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            on_complete_callback = None
+            if self.kv_event_sink is not None:
+                key_to_tokens: dict[CacheEngineKey, int] = {
+                    k: int(m.get_num_tokens())
+                    for k, m in zip(ks, objs, strict=False)
+                }
+
+                def _make_store_cb(
+                    backend_label: str,
+                    token_map: dict[CacheEngineKey, int],
+                    sink: Callable[[CacheStoreEvent | CacheEvictEvent], None],
+                ):
+                    def _cb(key: CacheEngineKey) -> None:
+                        if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                            return
+                        num_tokens = token_map.get(key)
+                        if num_tokens is None:
+                            return
+                        sink(
+                            CacheStoreEvent(
+                                block_hashes=[key.chunk_hash],
+                                parent_block_hash=None,
+                                token_ids=[],
+                                block_size=num_tokens,
+                                lora_id=None,
+                                medium=backend_label,
+                                lora_name=None,
+                            )
+                        )
+
+                    return _cb
+
+                on_complete_callback = _make_store_cb(
+                    backend_name, key_to_tokens, self.kv_event_sink
+                )
+
+            backend.batched_submit_put_task(
+                ks,
+                objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=on_complete_callback,
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:
@@ -448,7 +500,9 @@ class StorageManager:
         self,
         task: asyncio.Future,
         lookup_id: str,
-        cum_last_tier_chunk_lengths: list[int],
+        cum_chunk_lengths_total: list[int],
+        tier_expected_chunks: list[int],
+        tier_backend_names: list[str],
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -459,12 +513,41 @@ class StorageManager:
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
         res = task.result()
-        last_tier_retrieved_chunks = len(res[-1])
-        retrieved_length = cum_last_tier_chunk_lengths[last_tier_retrieved_chunks]
+        total_retrieved_chunks = 0
+        offset_chunks = 0
+        tier_hit_tokens: dict[str, int] = {}
+
+        for tier_idx, tier_result in enumerate(res):
+            actual_chunks = len(tier_result)
+            expected_chunks = tier_expected_chunks[tier_idx]
+
+            if actual_chunks > 0:
+                start = cum_chunk_lengths_total[offset_chunks]
+                end = cum_chunk_lengths_total[offset_chunks + actual_chunks]
+                backend_name = tier_backend_names[tier_idx]
+                tier_hit_tokens[backend_name] = int(end - start)
+
+            total_retrieved_chunks += actual_chunks
+            offset_chunks += expected_chunks
+
+            if actual_chunks < expected_chunks:
+                # Release chunks in subsequent tiers since prefix continuity broke.
+                for subsequent_tier in res[tier_idx + 1 :]:
+                    for mem_obj in subsequent_tier:
+                        try:
+                            mem_obj.ref_count_down()
+                        except Exception:
+                            pass
+                break
+
+        retrieved_length = cum_chunk_lengths_total[total_retrieved_chunks]
         logger.info(
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"
         )
+        self.async_lookup_server.lmcache_engine.lookup_tier_hit_tokens[
+            lookup_id
+        ] = tier_hit_tokens
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
     async def async_lookup_and_prefetch(
@@ -501,9 +584,10 @@ class StorageManager:
 
         num_total_chunks = len(keys)
         num_total_hit_chunks = 0
-        num_last_tier_hit_chunks = 0
         cum_chunk_lengths_total = cum_chunk_lengths[:]
         loading_tasks = []
+        tier_expected_chunks: list[int] = []
+        tier_backend_names: list[str] = []
         for backend_name, backend in self.storage_backends.items():
             if search_range and backend_name not in search_range:
                 continue
@@ -512,9 +596,9 @@ class StorageManager:
             if num_hit_chunks == 0:
                 continue
 
-            num_last_tier_hit_chunks = num_hit_chunks
-
             num_total_hit_chunks += num_hit_chunks
+            tier_expected_chunks.append(num_hit_chunks)
+            tier_backend_names.append(backend_name)
 
             loading_task = asyncio.create_task(
                 self.async_serializer.run(
@@ -560,9 +644,9 @@ class StorageManager:
             lambda future: self.prefetch_all_done_callback(
                 future,
                 lookup_id,
-                cum_chunk_lengths_total[
-                    num_total_hit_chunks - num_last_tier_hit_chunks :
-                ],
+                cum_chunk_lengths_total,
+                tier_expected_chunks,
+                tier_backend_names,
             )
         )
 

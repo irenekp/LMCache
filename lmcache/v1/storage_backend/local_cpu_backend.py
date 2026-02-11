@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import threading
 import time
 
@@ -12,7 +12,12 @@ import torch
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -78,6 +83,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
+        self.kv_event_sink = None
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -152,6 +158,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Synchronously put the MemoryObjs into the local cpu backend.
@@ -162,6 +169,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # TODO(Jiayi): optimize this with batching
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             self.submit_put_task(key, memory_obj)
+            if on_complete_callback is not None:
+                try:
+                    on_complete_callback(key)
+                except Exception as exc:
+                    logger.warning(
+                        "on_complete_callback failed for key %s: %s", key, exc
+                    )
 
     def get_blocking(
         self,
@@ -235,6 +249,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
         memory_obj = self.hot_cache.pop(key)
+        num_tokens = memory_obj.get_num_tokens()
         memory_obj.ref_count_down()
 
         if force:
@@ -244,6 +259,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if self.lmcache_worker is not None:
             self.lmcache_worker.put_msg(
                 KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
+            )
+        if self.kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            self.kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(num_tokens),
+                    medium=str(self),
+                )
             )
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because

@@ -95,6 +95,8 @@ class LMCacheLookupClient(LookupClientInterface):
         else:
             self.token_database = ChunkedTokenDatabase(config, metadata)
 
+        self.reqs_tier_stats: dict[str, dict[str, int]] = {}
+
     # FIXME(Jiayi): Cacheblend need token ids
     def lookup(
         self,
@@ -138,15 +140,30 @@ class LMCacheLookupClient(LookupClientInterface):
             ]
 
         results = []
+        tier_results: list[dict[str, int]] = []
         try:
             for i in range(ranks):
                 self.sockets[i].send_multipart(msg_buf, copy=False)
 
             # TODO(Jiayi): we can use zmq poll to optimize a bit
             for i in range(ranks):
-                resp = self.sockets[i].recv()
-                result = int.from_bytes(resp, "big")
+                parts = self.sockets[i].recv_multipart(copy=False)
+                if not parts:
+                    results.append(0)
+                    tier_results.append({})
+                    continue
+                result = int.from_bytes(parts[0].bytes, "big")
                 results.append(result)
+                if len(parts) >= 2:
+                    try:
+                        tier = msgspec.msgpack.decode(
+                            parts[1].bytes, type=dict[str, int]
+                        )
+                    except Exception:
+                        tier = {}
+                else:
+                    tier = {}
+                tier_results.append(tier)
         except zmq.Again:
             logger.error(f"Timeout occurred for rank {i}")
             return 0
@@ -163,7 +180,23 @@ class LMCacheLookupClient(LookupClientInterface):
         # NOTE: it is possible that the number of hit tokens is different
         # across TP ranks, so we can use the minimum value as the
         # number of hit tokens.
-        return min(results)
+        num_hit_toks = min(results)
+        min_by: dict[str, int] = {}
+        all_keys = set()
+        for d in tier_results:
+            all_keys.update(d.keys())
+        for k in all_keys:
+            vals = [d.get(k, 0) for d in tier_results]
+            min_by[k] = min(vals) if vals else 0
+        self.reqs_tier_stats[lookup_id] = min_by
+
+        return num_hit_toks
+
+    def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
+        return self.reqs_tier_stats.get(lookup_id)
+
+    def clear_lookup_status(self, lookup_id: str) -> None:
+        self.reqs_tier_stats.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -236,8 +269,12 @@ class LMCacheLookupServer:
                         pin=True,
                         request_configs=request_configs,
                     )
-                response = result.to_bytes(4, "big")
-                self.socket.send(response)
+                response = int(result).to_bytes(4, "big")
+                tier_stats = self.lmcache_engine.lookup_tier_hit_tokens.get(
+                    lookup_id, {}
+                )
+                tier_stats_bytes = msgspec.msgpack.encode(tier_stats)
+                self.socket.send_multipart([response, tier_stats_bytes])
 
         logger.info(f"lmcache lookup server start on {socket_path}")
         self.thread = threading.Thread(target=process_request, daemon=True)

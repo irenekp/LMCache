@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, TimeoutError
-from typing import Any, List, Optional, Sequence, Set
+from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
 import threading
 import time
@@ -10,7 +10,12 @@ import time
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -77,6 +82,7 @@ class RemoteBackend(StorageBackendInterface):
         # we must make decision (whether to send or not) at the local side
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.kv_event_sink = None
 
         # Create RemoteMonitor instance, which initializes the
         # connection status and active connector dynamically
@@ -176,6 +182,7 @@ class RemoteBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Future:
         def create_immediate_empty_future() -> Future:
             f: Future = Future()
@@ -206,8 +213,17 @@ class RemoteBackend(StorageBackendInterface):
         future = asyncio.run_coroutine_threadsafe(
             self.connection.put(key, compressed_memory_obj), self.loop
         )
-        lambda_callback = lambda f: self.put_callback(f, key)
-        future.add_done_callback(lambda_callback)
+        def put_done_callback(f: Future) -> None:
+            self.put_callback(f, key)
+            if on_complete_callback is not None:
+                try:
+                    on_complete_callback(key)
+                except Exception as exc:
+                    logger.warning(
+                        "on_complete_callback failed for key %s: %s", key, exc
+                    )
+
+        future.add_done_callback(put_done_callback)
         return future
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
@@ -222,6 +238,7 @@ class RemoteBackend(StorageBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         if self.connection is None:
             logger.warning(
@@ -239,15 +256,27 @@ class RemoteBackend(StorageBackendInterface):
                 compressed_memory_objs.append(self.serializer.serialize(memory_obj))
                 memory_obj.ref_count_down()
 
+            def batched_done_callback(f: Future) -> None:
+                self.batched_put_callback(f, list(keys))
+                if on_complete_callback is not None:
+                    for key in keys:
+                        try:
+                            on_complete_callback(key)
+                        except Exception as exc:
+                            logger.warning(
+                                "on_complete_callback failed for key %s: %s", key, exc
+                            )
+
             future = asyncio.run_coroutine_threadsafe(
                 self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
                 self.loop,
             )
-            lambda_callback = lambda f: self.batched_put_callback(f, keys)  # type: ignore
-            future.add_done_callback(lambda_callback)
+            future.add_done_callback(batched_done_callback)
         else:
             for key, memory_obj in zip(keys, memory_objs, strict=False):
-                self.submit_put_task(key, memory_obj)
+                self.submit_put_task(
+                    key, memory_obj, on_complete_callback=on_complete_callback
+                )
 
     @_lmcache_nvtx_annotate
     def get_blocking(
@@ -459,7 +488,35 @@ class RemoteBackend(StorageBackendInterface):
         return True
 
     def remove(self, key, force=True):
-        raise NotImplementedError("Remote backend does not support remove now.")
+        if self.connection is None:
+            logger.warning("Connection is None in remove, returning False")
+            return False
+
+        remover = getattr(self.connection, "remove_sync", None)
+        if remover is None:
+            remover = getattr(self.connection, "remove", None)
+        if remover is None:
+            logger.warning("Remote connector does not support remove, skipping.")
+            return False
+
+        try:
+            removed = remover(key)
+            if removed and self.kv_event_sink is not None:
+                if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                    return removed
+                self.kv_event_sink(
+                    CacheEvictEvent(
+                        block_hashes=[key.chunk_hash],
+                        block_size=int(self.config.chunk_size),
+                        medium=str(self),
+                    )
+                )
+            return removed
+        except Exception as exc:
+            logger.exception(
+                "Failed to remove key %s from remote backend: %s", key, exc
+            )
+            return False
 
     def get_allocator_backend(self):
         return self.local_cpu_backend

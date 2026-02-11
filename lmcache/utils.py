@@ -320,6 +320,27 @@ class LayerCacheEngineKey(CacheEngineKey):
         )
 
 
+@dataclass
+class CacheStoreEvent:
+    block_hashes: list[int]
+    parent_block_hash: int | None
+    token_ids: list[int]
+    block_size: int
+    lora_id: int | None
+
+    medium: str | None
+    lora_name: str | None
+
+
+@dataclass
+class CacheEvictEvent:
+    """Represents a cache eviction for a KV chunk."""
+
+    block_hashes: list[int]
+    block_size: int
+    medium: str | None
+
+
 ##### NVTX annotation #####
 _NVTX_COLORS = ["green", "blue", "purple", "rapids"]
 

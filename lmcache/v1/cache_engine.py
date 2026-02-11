@@ -6,6 +6,7 @@ from typing import (
     Callable,
     Dict,
     Generator,
+    Iterable,
     List,
     Optional,
     Tuple,
@@ -14,6 +15,7 @@ from typing import (
 import asyncio
 import gc
 import multiprocessing
+import threading
 import time
 
 # Third Party
@@ -24,7 +26,12 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    CacheStoreEvent,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.gpu_connector import (
@@ -84,6 +91,8 @@ class LMCacheEngine:
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
     ):
+        # Per-lookup tier hit breakdown for telemetry.
+        self.lookup_tier_hit_tokens: dict[str, dict[str, int]] = {}
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
         self.metadata = metadata
@@ -126,7 +135,18 @@ class LMCacheEngine:
             # self.memory_allocator,
             event_manager=self.event_manager,
             lmcache_worker=self.lmcache_worker,
+            kv_event_sink=self._append_kv_event if config.enable_kv_events else None,
         )
+
+        # KV events
+        self.kv_events_enabled = config.enable_kv_events
+        if self.kv_events_enabled:
+            self.kv_events: List[CacheStoreEvent | CacheEvictEvent] = []
+            self._kv_events_lock = threading.Lock()
+            logger.info("KV events are enabled.")
+        else:
+            self._kv_events_lock = None
+            logger.info("KV events are disabled.")
 
         # HACK: remove this in the future
         # NOTE (Jiayi): This is currently used to support
@@ -170,6 +190,14 @@ class LMCacheEngine:
             logger.info("Post-initializing LMCacheEngine")
             self.gpu_connector.initialize_kvcaches_ptr(**kwargs)
             self.post_inited = True
+
+    def _append_kv_event(self, event: CacheStoreEvent | CacheEvictEvent) -> None:
+        if not self.kv_events_enabled:
+            return
+        if self._kv_events_lock is None:
+            return
+        with self._kv_events_lock:
+            self.kv_events.append(event)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -692,6 +720,10 @@ class LMCacheEngine:
             if pin:
                 assert lookup_id is not None, "lookup_id is required when pin is True"
 
+            tier_hit_tokens: Optional[dict[str, int]] = (
+                {} if lookup_id is not None else None
+            )
+
             for start, end, key in self.token_database.process_tokens(
                 tokens=tokens,
                 hashes=hashes,
@@ -706,33 +738,56 @@ class LMCacheEngine:
                     key_all_layers = key.split_layers(self.num_layers)
 
                     found = False
+                    first_backend: Optional[str] = None
                     for key_single_layer in key_all_layers:
-                        if self.storage_manager.contains(
+                        backend_name = self.storage_manager.contains(
                             key_single_layer, search_range, pin
-                        ):
+                        )
+                        if backend_name is not None:
                             found = True
+                            if first_backend is None:
+                                first_backend = backend_name
                     if found:
                         if pin:
                             self.lookup_pins[lookup_id].extend(  # type: ignore
                                 key_all_layers
                             )
+                        if tier_hit_tokens is not None and first_backend is not None:
+                            tier_hit_tokens[first_backend] = (
+                                tier_hit_tokens.get(first_backend, 0)
+                                + (end - start)
+                            )
                         prev_end = end
                         continue
                     end = prev_end
+                    if lookup_id is not None and tier_hit_tokens is not None:
+                        self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
                     return prev_end
                 else:
-                    if self.storage_manager.contains(key, search_range, pin):
+                    backend_name = self.storage_manager.contains(
+                        key, search_range, pin
+                    )
+                    if backend_name is not None:
                         if pin:
                             self.lookup_pins[lookup_id].append(  # type: ignore
                                 key
+                            )
+                        if tier_hit_tokens is not None:
+                            tier_hit_tokens[backend_name] = (
+                                tier_hit_tokens.get(backend_name, 0)
+                                + (end - start)
                             )
                         prev_end = end
                         continue
 
                     end = prev_end
+                    if lookup_id is not None and tier_hit_tokens is not None:
+                        self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
                     return prev_end
 
             # all tokens where found, return the maximal end
+            if lookup_id is not None and tier_hit_tokens is not None:
+                self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
             return end
         finally:
             self.stats_monitor.on_lookup_finished(end)
@@ -965,9 +1020,23 @@ class LMCacheEngine:
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_ids: list[str]) -> None:
         for lookup_id in lookup_ids:
+            self.lookup_tier_hit_tokens.pop(lookup_id, None)
             if lookup_id in self.lookup_pins:
                 self.storage_manager.batched_unpin(self.lookup_pins[lookup_id])
                 del self.lookup_pins[lookup_id]
+
+    @_lmcache_nvtx_annotate
+    def get_kv_events(self) -> Iterable[CacheStoreEvent | CacheEvictEvent]:
+        if not self.kv_events_enabled:
+            return []
+        if self._kv_events_lock is None:
+            return []
+        with self._kv_events_lock:
+            if not self.kv_events:
+                return []
+            events = self.kv_events
+            self.kv_events = []
+            return events
 
     @_lmcache_nvtx_annotate
     def clear(

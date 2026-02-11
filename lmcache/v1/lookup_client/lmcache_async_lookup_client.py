@@ -111,11 +111,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # None indicates ongoing.
         # int indicates number of hit tokens.
         self.reqs_status: dict[str, Optional[int]] = {}
+        self.reqs_tier_stats: dict[str, dict[str, int]] = {}
 
         # map from lookup_id to number of hit tokens for each worker
         self.res_for_each_worker: dict[str, list[int]] = {}
+        self.tier_for_each_worker: dict[str, list[dict[str, int]]] = {}
 
-        # The two parts are [lookup_id, num_hit_tokens]
+        # The parts are [lookup_id, num_hit_tokens, (optional) tier_stats]
         self.num_parts = 2
 
         self.running = True
@@ -185,9 +187,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     def process_responses_from_workers(self):
         while self.running:
             frames = self.pull_socket.recv_multipart(copy=False)
-            assert len(frames) == self.num_parts
+            if len(frames) < self.num_parts:
+                logger.warning("Malformed response received: %s frames", len(frames))
+                continue
             lookup_id = frames[0].bytes.decode("utf-8")
             res = int.from_bytes(frames[1], "big")
+            tier_stats: dict[str, int] = {}
+            if len(frames) >= 3:
+                try:
+                    tier_stats = msgspec.msgpack.decode(
+                        frames[2].bytes, type=dict[str, int]
+                    )
+                except Exception:
+                    tier_stats = {}
 
             with self.lock:
                 if lookup_id not in self.res_for_each_worker:
@@ -196,17 +208,45 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     self.res_for_each_worker[lookup_id].append(res)
                 all_res = self.res_for_each_worker[lookup_id]
 
-                if len(all_res) == self.tensor_parallel_size or (
-                    self.create_lookup_server_only_on_worker_0_for_mla
-                    and len(all_res) == 1
-                ):
-                    self.res_for_each_worker.pop(lookup_id)
+                if lookup_id not in self.tier_for_each_worker:
+                    self.tier_for_each_worker[lookup_id] = [tier_stats]
+                else:
+                    self.tier_for_each_worker[lookup_id].append(tier_stats)
+                all_tiers = self.tier_for_each_worker[lookup_id]
+
+                expected = (
+                    1
+                    if self.create_lookup_server_only_on_worker_0_for_mla
+                    else self.tensor_parallel_size
+                )
+                if len(all_res) == expected:
+                    self.res_for_each_worker.pop(lookup_id, None)
+                    self.tier_for_each_worker.pop(lookup_id, None)
 
                     # NOTE: it is possible that the number of hit
                     # tokens is different across TP ranks, so we
                     # can use the minimum value as the number of
                     # hit tokens.
                     self.reqs_status[lookup_id] = min(all_res)
+                    min_by: dict[str, int] = {}
+                    all_keys = set()
+                    for d in all_tiers:
+                        all_keys.update(d.keys())
+                    for k in all_keys:
+                        vals = [d.get(k, 0) for d in all_tiers]
+                        min_by[k] = min(vals) if vals else 0
+                    self.reqs_tier_stats[lookup_id] = min_by
+
+    def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
+        with self.lock:
+            return self.reqs_tier_stats.get(lookup_id)
+
+    def clear_lookup_status(self, lookup_id: str) -> None:
+        with self.lock:
+            self.reqs_status.pop(lookup_id, None)
+            self.reqs_tier_stats.pop(lookup_id, None)
+            self.res_for_each_worker.pop(lookup_id, None)
+            self.tier_for_each_worker.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -306,7 +346,11 @@ class LMCacheAsyncLookupServer:
     def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
         lookup_id_buf = lookup_id.encode("utf-8")
         num_hit_tokens_buf = num_hit_tokens.to_bytes(4, "big")
-        self.push_socket.send_multipart([lookup_id_buf, num_hit_tokens_buf], copy=False)
+        tier_stats = self.lmcache_engine.lookup_tier_hit_tokens.get(lookup_id, {})
+        tier_stats_buf = msgspec.msgpack.encode(tier_stats)
+        self.push_socket.send_multipart(
+            [lookup_id_buf, num_hit_tokens_buf, tier_stats_buf], copy=False
+        )
 
     def close(self):
         self.running = False

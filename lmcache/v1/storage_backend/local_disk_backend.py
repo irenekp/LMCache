@@ -13,7 +13,13 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvictEvent,
+    DiskCacheMetadata,
+    LayerCacheEngineKey,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -150,6 +156,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self.kv_event_sink = None
 
     def __str__(self):
         return "LocalDiskBackend"
@@ -239,6 +246,17 @@ class LocalDiskBackend(StorageBackendInterface):
                 KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
             )
 
+        if self.kv_event_sink is not None:
+            if isinstance(key, LayerCacheEngineKey) and key.layer_id != 0:
+                return True
+            self.kv_event_sink(
+                CacheEvictEvent(
+                    block_hashes=[key.chunk_hash],
+                    block_size=int(self.config.chunk_size),
+                    medium=str(self),
+                )
+            )
+
         return True
 
     def insert_key(
@@ -270,6 +288,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
         assert memory_obj.tensor is not None
 
@@ -317,6 +336,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
+                on_complete_callback=on_complete_callback,
             ),
             self.loop,
         )
@@ -327,9 +347,12 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(key, memory_obj)
+            self.submit_put_task(
+                key, memory_obj, on_complete_callback=on_complete_callback
+            )
 
     def get_blocking(
         self,
@@ -443,6 +466,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Convert KV to bytes and async store bytes to disk.
@@ -472,6 +496,14 @@ class LocalDiskBackend(StorageBackendInterface):
         self.insert_key(key, size, shape, dtype, fmt)
 
         self.disk_worker.remove_put_task(key)
+
+        if on_complete_callback is not None:
+            try:
+                on_complete_callback(key)
+            except Exception as exc:
+                logger.warning(
+                    "on_complete_callback failed for key %s: %s", key, exc
+                )
 
     def batched_async_load_bytes_from_disk(
         self,

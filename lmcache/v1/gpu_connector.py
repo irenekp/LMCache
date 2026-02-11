@@ -21,7 +21,39 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 
+class GPUConnectorTimingSink(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def record_copy_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
+        """Host/CPU -> GPU restore copy interval (load_stream)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def record_stall_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
+        """Compute-stream stall interval caused by waiting on load_stream."""
+        raise NotImplementedError
+
+
+def _maybe_new_cuda_event(enable: bool) -> Optional["torch.cuda.Event"]:
+    if not enable:
+        return None
+    return torch.cuda.Event(enable_timing=True)
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
+    def _maybe_update_timing_sink(self, **kwargs) -> None:
+        if "timing_sink" in kwargs:
+            self._timing_sink = kwargs["timing_sink"]
+
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         # FIXME (Yihua): We shouldn't put start and end here since
@@ -161,6 +193,14 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
+        # Optional timing sink for telemetry.
+        self._timing_sink: Optional[GPUConnectorTimingSink] = kwargs.get(
+            "timing_sink", None)
+
+    def set_timing_sink(
+        self, timing_sink: Optional[GPUConnectorTimingSink]
+    ) -> None:
+        self._timing_sink = timing_sink
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
         self.device = kv_caches[0].device
@@ -310,9 +350,33 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        self._maybe_update_timing_sink(**kwargs)
+
+        emit = self._timing_sink is not None
+
+        emit_copy = False
+        if emit:
+            for mo in memory_objs:
+                if mo.tensor is not None and not mo.tensor.is_cuda:
+                    emit_copy = True
+                    break
+
+        copy_start = _maybe_new_cuda_event(emit_copy)
+        copy_end = _maybe_new_cuda_event(emit_copy)
+
         with torch.cuda.stream(self.load_stream):
+            if copy_start is not None:
+                copy_start.record(self.load_stream)
+
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
+
+            if copy_end is not None:
+                copy_end.record(self.load_stream)
+
+        if emit_copy and copy_start is not None and copy_end is not None:
+            self._timing_sink.record_copy_interval(copy_start, copy_end)
+
         self.load_stream.synchronize()
 
     # TODO(Jiayi): need to optimize to enable real batching
@@ -353,6 +417,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
+        self._timing_sink: Optional[GPUConnectorTimingSink] = kwargs.get(
+            "timing_sink", None)
+
+    def set_timing_sink(
+        self, timing_sink: Optional[GPUConnectorTimingSink]
+    ) -> None:
+        self._timing_sink = timing_sink
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -362,6 +433,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+        self._timing_sink: Optional[GPUConnectorTimingSink] = kwargs.get(
+            "timing_sink", None)
+
+    def set_timing_sink(
+        self, timing_sink: Optional[GPUConnectorTimingSink]
+    ) -> None:
+        self._timing_sink = timing_sink
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -439,6 +517,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
         """
+        self._maybe_update_timing_sink(**kwargs)
 
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -494,6 +573,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert compute_gpu_buffer_obj.tensor is not None
         assert load_gpu_buffer_obj.tensor is not None
 
+        emit = getattr(self, "_timing_sink", None) is not None
+
         # current_stream = torch.cuda.current_stream()
 
         if self.cache_positions:
@@ -544,8 +625,14 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             if layer_id < self.num_layers:
                 memory_objs_layer = yield
 
+                copy_start = _maybe_new_cuda_event(emit)
+                copy_end = _maybe_new_cuda_event(emit)
+
                 # memobj -> gpu_buffer
                 with torch.cuda.stream(self.load_stream):
+                    if copy_start is not None:
+                        copy_start.record(self.load_stream)
+
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -563,6 +650,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.old_positions
+
+                    if copy_end is not None:
+                        copy_end.record(self.load_stream)
+
+                if emit and copy_start is not None and copy_end is not None:
+                    self._timing_sink.record_copy_interval(copy_start, copy_end)
 
             elif layer_id == self.num_layers:
                 yield
@@ -801,6 +894,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
+        self._maybe_update_timing_sink(**kwargs)
 
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -846,12 +940,27 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             if sync:
-                current_stream.wait_stream(self.load_stream)
+                if self._timing_sink is not None and layer_id > 0:
+                    stall_start = torch.cuda.Event(enable_timing=True)
+                    stall_end = torch.cuda.Event(enable_timing=True)
+                    stall_start.record(current_stream)
+                    current_stream.wait_stream(self.load_stream)
+                    stall_end.record(current_stream)
+                    self._timing_sink.record_stall_interval(
+                        stall_start, stall_end, layer_id=layer_id - 1
+                    )
+                else:
+                    current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                copy_start = None
+                if self._timing_sink is not None:
+                    copy_start = torch.cuda.Event(enable_timing=True)
+                    copy_start.record(self.load_stream)
+
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
@@ -879,11 +988,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         True,
                         self.vllm_two_major,
                     )
+                if copy_start is not None:
+                    copy_end = torch.cuda.Event(enable_timing=True)
+                    copy_end.record(self.load_stream)
+                    self._timing_sink.record_copy_interval(copy_start, copy_end)
         yield
 
         # synchronize the last layer
         if sync:
-            current_stream.wait_stream(self.load_stream)
+            if self._timing_sink is not None and self.num_layers > 0:
+                stall_start = torch.cuda.Event(enable_timing=True)
+                stall_end = torch.cuda.Event(enable_timing=True)
+                stall_start.record(current_stream)
+                current_stream.wait_stream(self.load_stream)
+                stall_end.record(current_stream)
+                self._timing_sink.record_stall_interval(
+                    stall_start, stall_end, layer_id=self.num_layers - 1
+                )
+            else:
+                current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
         assert tmp_gpu_buffer_obj is not None

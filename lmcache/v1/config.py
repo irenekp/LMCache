@@ -124,6 +124,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # KV events configuration
+    "enable_kv_events": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "pre_caching_hash_algorithm": {
         "type": str,
         "default": "builtin",
