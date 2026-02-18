@@ -22,6 +22,7 @@ from vllm.distributed.parallel_state import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils import cdiv, get_kv_cache_torch_dtype
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm.version import __version__ as VLLM_VERSION
 import torch
 
@@ -67,6 +68,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
 def _split_tier_stats(tier_stats: Any) -> dict[str, int]:
     if not isinstance(tier_stats, dict):
         return {}
@@ -74,6 +82,14 @@ def _split_tier_stats(tier_stats: Any) -> dict[str, int]:
     if isinstance(min_payload, dict):
         return dict(min_payload)
     return dict(tier_stats)
+
+
+def _normalize_block_hash_for_kv_events(block_hash: Any) -> Any:
+    # vLLM KV cache manager emits hashes via maybe_convert_block_hash(...)
+    # (int by default). Keep connector-side hashes in the same representation.
+    if isinstance(block_hash, (bytes, bytearray)):
+        return maybe_convert_block_hash(bytes(block_hash))
+    return block_hash
 
 
 @dataclass
@@ -141,6 +157,8 @@ class RequestTracker:
     # FIXME: need to check whether the block ids will be changed after
     #        preemption
     allocated_block_ids: list[int]
+    # The vLLM block hashes corresponding to full blocks.
+    block_hashes: list[Any] = field(default_factory=list)
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -169,6 +187,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        block_hashes: Optional[list[Any]] = None,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -214,6 +233,7 @@ class RequestTracker:
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            block_hashes=list(block_hashes or []),
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -275,6 +295,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # vLLM block hashes aligned with chunk indices (full blocks only)
+    block_hashes: Optional[list[Any]] = None
 
     @staticmethod
     def from_request_tracker(
@@ -406,6 +428,7 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            block_hashes=tracker.block_hashes,
         )
 
 
@@ -694,6 +717,9 @@ class LMCacheConnectorV1Impl:
         self._hash_translation: dict[int, Any] = {}
         self._hash_translation_sizes: dict[int, int] = {}
         self._hash_translation_lock = threading.Lock()
+        self._debug_hash_translation = _env_flag(
+            "LMCACHE_DEBUG_HASH_TRANSLATION", False
+        )
 
         # TODO(baoloongmao): Internal api server & plugin framework support dp > 1
         if vllm_config.parallel_config.data_parallel_rank_local == 0:
@@ -1173,27 +1199,99 @@ class LMCacheConnectorV1Impl:
             logger.debug("Failed to build hash translation table: %s", exc)
             return
 
+        entries_total = 0
+        mapped = 0
+        skipped = 0
         with self._hash_translation_lock:
             for start, end, lm_hash in entries:
+                entries_total += 1
                 block_idx = start // self._lmcache_chunk_size
                 if block_idx >= len(block_hashes):
+                    skipped += 1
                     continue
-                self._hash_translation[lm_hash] = block_hashes[block_idx]
+                self._hash_translation[lm_hash] = _normalize_block_hash_for_kv_events(
+                    block_hashes[block_idx]
+                )
                 self._hash_translation_sizes[lm_hash] = end - start
+                mapped += 1
+
+            if self._debug_hash_translation:
+                map_size = len(self._hash_translation)
+                masked_tokens = int(store_mask.sum().item())
+                logger.info(
+                    "[dup-debug] hash map update: entries=%d mapped=%d skipped=%d "
+                    "map_size=%d token_ids=%d masked_tokens=%d block_hashes=%d",
+                    entries_total,
+                    mapped,
+                    skipped,
+                    map_size,
+                    len(token_ids),
+                    masked_tokens,
+                    len(block_hashes),
+                )
 
     def _translate_kv_hashes(self, hashes: list[Any]) -> list[Any]:
         if not hashes:
             return []
         with self._hash_translation_lock:
-            return [self._hash_translation.get(h, h) for h in hashes]
+            translated: list[Any] = []
+            hits = 0
+            misses = 0
+            sample_misses: list[Any] = []
+            for h in hashes:
+                if h in self._hash_translation:
+                    hits += 1
+                    translated.append(self._hash_translation[h])
+                else:
+                    misses += 1
+                    translated.append(h)
+                    if len(sample_misses) < 4:
+                        sample_misses.append(h)
+
+            if self._debug_hash_translation:
+                logger.info(
+                    "[dup-debug] hash translate: total=%d hits=%d misses=%d "
+                    "map_size=%d sample_misses=%s",
+                    len(hashes),
+                    hits,
+                    misses,
+                    len(self._hash_translation),
+                    sample_misses,
+                )
+            return translated
 
     def _evict_hash_translation(self, hashes: list[Any]) -> None:
         if not hashes:
             return
+        removed = 0
         with self._hash_translation_lock:
             for h in hashes:
-                self._hash_translation.pop(h, None)
+                removed += int(self._hash_translation.pop(h, None) is not None)
                 self._hash_translation_sizes.pop(h, None)
+            if self._debug_hash_translation:
+                logger.info(
+                    "[dup-debug] hash evict: requested=%d removed=%d map_size=%d",
+                    len(hashes),
+                    removed,
+                    len(self._hash_translation),
+                )
+
+    def _translated_block_size_from_lm_hashes(
+        self,
+        lm_hashes: list[Any],
+        fallback: int,
+    ) -> int:
+        if not lm_hashes:
+            return fallback
+        with self._hash_translation_lock:
+            sizes = [
+                self._hash_translation_sizes.get(h)
+                for h in lm_hashes
+            ]
+        known = [s for s in sizes if isinstance(s, int) and s > 0]
+        if not known:
+            return fallback
+        return int(sum(known))
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> list[CacheStoreEvent | CacheEvictEvent]:
@@ -1202,18 +1300,32 @@ class LMCacheConnectorV1Impl:
         events = self.lmcache_engine.get_kv_events()
         if not events:
             return []
+        if self._debug_hash_translation:
+            store_events = sum(1 for e in events if hasattr(e, "parent_block_hash"))
+            evict_events = len(events) - store_events
+            logger.info(
+                "[dup-debug] raw kv events: total=%d stores=%d evicts=%d",
+                len(events),
+                store_events,
+                evict_events,
+            )
         translated: list[CacheStoreEvent | CacheEvictEvent] = []
         for event in events:
+            translated_hashes = self._translate_kv_hashes(event.block_hashes)
+            translated_block_size = self._translated_block_size_from_lm_hashes(
+                event.block_hashes,
+                int(event.block_size),
+            )
             if hasattr(event, "parent_block_hash"):
                 parent_hash = event.parent_block_hash
                 if parent_hash is not None:
                     parent_hash = self._translate_kv_hashes([parent_hash])[0]
                 translated.append(
                     CacheStoreEvent(
-                        block_hashes=self._translate_kv_hashes(event.block_hashes),
+                        block_hashes=translated_hashes,
                         parent_block_hash=parent_hash,
                         token_ids=event.token_ids,
-                        block_size=event.block_size,
+                        block_size=translated_block_size,
                         lora_id=getattr(event, "lora_id", None),
                         medium=event.medium,
                         lora_name=getattr(event, "lora_name", None),
@@ -1222,8 +1334,8 @@ class LMCacheConnectorV1Impl:
             else:
                 translated.append(
                     CacheEvictEvent(
-                        block_hashes=self._translate_kv_hashes(event.block_hashes),
-                        block_size=event.block_size,
+                        block_hashes=translated_hashes,
+                        block_size=translated_block_size,
                         medium=event.medium,
                     )
                 )
@@ -1457,12 +1569,18 @@ class LMCacheConnectorV1Impl:
                 and request_priority > self.config.priority_limit
             )
 
+            request_obj = self._unfinished_requests.get(request.req_id)
+            block_hashes = None
+            if request_obj is not None:
+                block_hashes = list(getattr(request_obj, "block_hashes", []))
+
             request_tracker = RequestTracker.from_new_request(
                 self.config,
                 request,
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                block_hashes=block_hashes,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -1486,6 +1604,10 @@ class LMCacheConnectorV1Impl:
             for i, req in enumerate(cached_reqs):
                 request_tracker = self._request_trackers[req.req_id]
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
+                if request_obj := self._unfinished_requests.get(req.req_id):
+                    request_tracker.block_hashes = list(
+                        getattr(request_obj, "block_hashes", [])
+                    )
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
@@ -1514,6 +1636,7 @@ class LMCacheConnectorV1Impl:
             new_block_ids = cached_reqs.new_block_ids[i]
 
             request_tracker.update(new_token_ids, new_block_ids)
+            request_tracker.block_hashes = list(getattr(request, "block_hashes", []))
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -1548,6 +1671,17 @@ class LMCacheConnectorV1Impl:
                 "first_tok": request._output_token_ids[0],
             }
 
+        finished_reason = None
+        if hasattr(request, "get_finished_reason"):
+            try:
+                finished_reason = request.get_finished_reason()
+            except Exception:
+                finished_reason = None
+        if finished_reason is not None and str(finished_reason).lower() == "abort":
+            if isinstance(getattr(request, "kv_transfer_params", None), dict):
+                request.kv_transfer_params.pop("_lmcache_telemetry", None)
+            return False, return_params
+
         gpu_hit_tokens = 0
         lmcache_by_tier: dict[str, int] = {}
         total_cache_tokens = 0
@@ -1579,11 +1713,19 @@ class LMCacheConnectorV1Impl:
 
         if return_params is None:
             return_params = {}
+        host_hit_tokens_by_tier = {
+            str(k): int(v) for k, v in lmcache_by_tier.items() if int(v) > 0
+        }
+        host_hit_tokens = int(sum(host_hit_tokens_by_tier.values()))
+        total_cache_tokens = int(gpu_hit_tokens) + host_hit_tokens
         return_params.update(
             {
-                "gpu_hit_tokens": gpu_hit_tokens,
-                "lmcache_hit_tokens_by_tier": lmcache_by_tier,
-                "total_cache_tokens": total_cache_tokens,
+                "cache_hit": {
+                    "gpu_hit_tokens": int(gpu_hit_tokens),
+                    "host_hit_tokens": host_hit_tokens,
+                    "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
+                    "total_cache_tokens": total_cache_tokens,
+                }
             }
         )
         if isinstance(getattr(request, "kv_transfer_params", None), dict):
