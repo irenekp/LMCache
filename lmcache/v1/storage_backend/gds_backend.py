@@ -2,7 +2,7 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import asyncio
 import ctypes
 import json
@@ -391,7 +391,12 @@ class GdsBackend(AllocatorBackendInterface):
         with self.put_lock:
             return key in self.put_tasks
 
-    def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Future:
+    def submit_put_task(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> Future:
         assert memory_obj.tensor is not None
         memory_obj.ref_count_up()
 
@@ -399,7 +404,10 @@ class GdsBackend(AllocatorBackendInterface):
             self.put_tasks.add(key)
 
         future = asyncio.run_coroutine_threadsafe(
-            self._async_save_bytes_to_disk(key, memory_obj), self.loop
+            self._async_save_bytes_to_disk(
+                key, memory_obj, on_complete_callback=on_complete_callback
+            ),
+            self.loop,
         )
         return future
 
@@ -408,10 +416,13 @@ class GdsBackend(AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Union[List[Future], None]:
         futures = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            future = self.submit_put_task(key, memory_obj)
+            future = self.submit_put_task(
+                key, memory_obj, on_complete_callback=on_complete_callback
+            )
             futures.append(future)
         return futures
 
@@ -419,6 +430,7 @@ class GdsBackend(AllocatorBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Convert KV to bytes and async store bytes to disk.
@@ -452,6 +464,12 @@ class GdsBackend(AllocatorBackendInterface):
         task.add_done_callback(self.save_metadata_tasks.discard)
         with self.put_lock:
             self.put_tasks.discard(key)
+
+        if on_complete_callback is not None:
+            try:
+                on_complete_callback(key)
+            except Exception as exc:
+                logger.warning("on_complete_callback failed for key %s: %s", key, exc)
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
