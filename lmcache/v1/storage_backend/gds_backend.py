@@ -331,12 +331,29 @@ class GdsBackend(AllocatorBackendInterface):
             buf = f.read(_METADATA_MAX_SIZE)
 
         shape, dtype, size, extra_metadata = unpack_metadata(buf)
-        if extra_metadata["lmcache_version"] != str(_METADATA_VERSION):
-            raise RuntimeError("unhandled lmcache metadata")
+        if extra_metadata.get("lmcache_version") != str(_METADATA_VERSION):
+            raise UnsupportedMetadataVersion(
+                f"Unsupported metadata version: {extra_metadata.get('lmcache_version')}"
+            )
 
-        # TODO(extra_metadata)
+        fmt_name = extra_metadata.get("memory_format")
+        if fmt_name is None:
+            logger.warning(
+                "Skipping stale cache metadata without memory_format at %s", filename
+            )
+            raise UnsupportedMetadataVersion(
+                "Missing required memory_format metadata field"
+            )
+
+        try:
+            fmt = MemoryFormat[fmt_name]
+        except KeyError as e:
+            raise UnsupportedMetadataVersion(
+                f"Unsupported memory_format metadata value: {fmt_name}"
+            ) from e
+
         metadata = DiskCacheMetadata(
-            filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype
+            filename.removesuffix(_METADATA_FILE_SUFFIX), size, shape, dtype, fmt
         )
         with self.hot_lock:
             self.metadata_dirs.add(subdir_key)
@@ -452,6 +469,7 @@ class GdsBackend(AllocatorBackendInterface):
             kv_chunk,
             self.cufile_base_pointer,
             memory_obj.metadata.address,
+            memory_obj.metadata.fmt,
         )
 
         self.insert_key(key, memory_obj)
@@ -476,8 +494,9 @@ class GdsBackend(AllocatorBackendInterface):
         size = memory_obj.get_physical_size()
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
+        fmt = memory_obj.metadata.fmt
         with self.hot_lock:
-            self.hot_cache[key] = DiskCacheMetadata(path, size, shape, dtype)
+            self.hot_cache[key] = DiskCacheMetadata(path, size, shape, dtype, fmt)
 
     def submit_prefetch_task(
         self,
@@ -508,8 +527,9 @@ class GdsBackend(AllocatorBackendInterface):
         path: str,
         dtype: torch.dtype,
         shape: torch.Size,
+        fmt: MemoryFormat,
     ) -> Optional[MemoryObj]:
-        return self._load_bytes_from_disk(key, path, dtype, shape)
+        return self._load_bytes_from_disk(key, path, dtype, shape, fmt)
 
     def get_blocking(
         self,
@@ -523,9 +543,51 @@ class GdsBackend(AllocatorBackendInterface):
         path = entry.path
         dtype = entry.dtype
         shape = entry.shape
+        fmt = entry.fmt
         assert dtype is not None
         assert shape is not None
-        return self._load_bytes_from_disk(key, path, dtype=dtype, shape=shape)
+        assert fmt is not None
+        return self._load_bytes_from_disk(key, path, dtype=dtype, shape=shape, fmt=fmt)
+
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """
+        Blocking batched get function.
+        Returns only the contiguous prefix that can be loaded successfully.
+        """
+        mem_objs: list[Optional[MemoryObj]] = []
+        for key in keys:
+            memory_obj = self.get_blocking(key)
+            if memory_obj is None:
+                break
+            mem_objs.append(memory_obj)
+        return mem_objs
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        transfer_spec: Any = None,
+    ) -> list[MemoryObj]:
+        del lookup_id, transfer_spec
+        mem_objs = await asyncio.to_thread(self.batched_get_blocking, keys)
+        return [m for m in mem_objs if m is not None]
+
+    async def batched_async_contains(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        del lookup_id
+        num_hit_chunks = 0
+        for key in keys:
+            if not self.contains(key, pin=pin):
+                return num_hit_chunks
+            num_hit_chunks += 1
+        return num_hit_chunks
 
     def _load_bytes_from_disk(
         self,
@@ -533,11 +595,12 @@ class GdsBackend(AllocatorBackendInterface):
         path: str,
         dtype: torch.dtype,
         shape: torch.Size,
+        fmt: MemoryFormat,
     ) -> Optional[MemoryObj]:
         """
         Load byte array from disk.
         """
-        memory_obj = self.memory_allocator.allocate(shape, dtype)
+        memory_obj = self.memory_allocator.allocate(shape, dtype, fmt)
         if memory_obj is None:
             logger.debug("Memory allocation failed during sync disk load.")
             return None
@@ -589,6 +652,7 @@ class GdsBackend(AllocatorBackendInterface):
         kv_chunk: torch.Tensor,
         base_pointer: int,
         device_offset: int,
+        memory_format: MemoryFormat,
     ):
         if base_pointer is None:
             addr = ctypes.c_void_p(kv_chunk.data_ptr())
@@ -600,7 +664,11 @@ class GdsBackend(AllocatorBackendInterface):
         offset = _METADATA_MAX_SIZE
         # TODO: We can add the chunk's metadata here, e.g. Tensor parallelism shard
         # and pipeline parallelism index.
-        metadata = pack_metadata(kv_chunk, lmcache_version=str(_METADATA_VERSION))
+        metadata = pack_metadata(
+            kv_chunk,
+            lmcache_version=str(_METADATA_VERSION),
+            memory_format=memory_format.name,
+        )
         try:
             with open(tmp_path, "wb") as f:
                 f.write(metadata)

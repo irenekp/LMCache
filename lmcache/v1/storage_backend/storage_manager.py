@@ -453,6 +453,7 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
+        locations: Optional[List[str]] = None,
     ) -> Generator[Future, None, None]:
         """
         Non-blocking function to get the memory objects into the storages
@@ -464,25 +465,114 @@ class StorageManager:
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
+        :param Optional[List[str]] locations: Optional backend name for each
+            chunk. If provided, mixed-backend retrieval is enabled and each
+            chunk is fetched from the corresponding backend.
+
         :return: A generator that yields a future for each layer.
         """
-        if location is None:
+        if location is None and locations is None:
             location = "LocalCPUBackend"
 
         for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
+            if locations is not None:
+                get_coro = self._layerwise_get_by_locations(keys_multi_chunk, locations)
+            else:
+                assert location is not None
+                backend = self.storage_backends[location]
+                get_coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id", keys_multi_chunk
+                )
+
             # TODO(Jiayi): need to make async loading and layerwise compatible
             task = asyncio.run_coroutine_threadsafe(
                 self.async_serializer.run(
-                    backend.batched_get_non_blocking(
-                        "fake_lookup_id", keys_multi_chunk
-                    ),
+                    get_coro,
                     len(keys_multi_chunk),
                 ),
                 self.loop,
             )
             yield task
+
+    async def _layerwise_get_by_locations(
+        self,
+        keys_multi_chunk: list[CacheEngineKey],
+        locations: list[str],
+    ) -> list[MemoryObj]:
+        """Fetch one layer's chunks from mixed backends and keep only valid prefix."""
+        if len(keys_multi_chunk) != len(locations):
+            raise ValueError(
+                "keys_multi_chunk and locations should have the same length in "
+                "layerwise mixed-backend retrieval"
+            )
+
+        if not keys_multi_chunk:
+            return []
+
+        grouped: OrderedDict[str, tuple[list[int], list[CacheEngineKey]]] = OrderedDict()
+        for idx, (key, backend_name) in enumerate(zip(keys_multi_chunk, locations)):
+            if backend_name not in self.storage_backends:
+                logger.warning(
+                    "Backend %s is not found in storage backends during layerwise "
+                    "mixed-backend retrieval",
+                    backend_name,
+                )
+                return []
+            if backend_name not in grouped:
+                grouped[backend_name] = ([], [])
+            indices, backend_keys = grouped[backend_name]
+            indices.append(idx)
+            backend_keys.append(key)
+
+        grouped_items = list(grouped.items())
+        tasks = []
+        for backend_name, (_, backend_keys) in grouped_items:
+            backend = self.storage_backends[backend_name]
+            tasks.append(
+                asyncio.create_task(
+                    backend.batched_get_non_blocking("fake_lookup_id", backend_keys)
+                )
+            )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        merged: list[Optional[MemoryObj]] = [None] * len(keys_multi_chunk)
+        for (backend_name, (indices, _)), result in zip(
+            grouped_items, results, strict=False
+        ):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Layerwise mixed-backend get failed for backend %s: %s",
+                    backend_name,
+                    result,
+                )
+                continue
+
+            if len(result) < len(indices):
+                logger.warning(
+                    "Layerwise mixed-backend get returned only %d/%d objects from %s",
+                    len(result),
+                    len(indices),
+                    backend_name,
+                )
+
+            for idx, memory_obj in zip(indices, result, strict=False):
+                if memory_obj is None:
+                    break
+                merged[idx] = memory_obj
+
+        first_missing_idx = len(merged)
+        for idx, memory_obj in enumerate(merged):
+            if memory_obj is None:
+                first_missing_idx = idx
+                break
+
+        # Release objects beyond the valid prefix to avoid leaks.
+        for memory_obj in merged[first_missing_idx:]:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+
+        return [m for m in merged[:first_missing_idx] if m is not None]
 
     def prefetch_single_done_callback(
         self,

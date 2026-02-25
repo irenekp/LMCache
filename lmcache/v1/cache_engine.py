@@ -589,6 +589,7 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        chunk_locations = []
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
@@ -602,21 +603,46 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            # NOTE: Only check the first layer
-            if not self.storage_manager.contains(keys_multi_layer[0]):
+            location = self.storage_manager.contains(keys_multi_layer[0])
+            if location is None:
+                break
+
+            all_layers_found = True
+            for key_single_layer in keys_multi_layer[1:]:
+                if (
+                    self.storage_manager.contains(
+                        key_single_layer, search_range=[location]
+                    )
+                    is None
+                ):
+                    all_layers_found = False
+                    break
+
+            if not all_layers_found:
                 break
 
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
+            chunk_locations.append(location)
 
-            ret_mask[start:end] = True
-
+        mem_obj_consumer = None
         if keys:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major, locations=chunk_locations
+            )
+
+            mem_objs_layers = []
+            valid_chunk_count = len(keys)
+            for _ in range(self.num_layers):
+                task = next(get_generator)
+                assert task is not None
+                mem_objs_layer = task.result()
+                valid_chunk_count = min(valid_chunk_count, len(mem_objs_layer))
+                mem_objs_layers.append(mem_objs_layer)
 
             assert isinstance(
                 self.gpu_connector,
@@ -626,28 +652,55 @@ class LMCacheEngine:
                     SGLangLayerwiseGPUConnector,
                 ),
             )
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+
+            starts = starts[:valid_chunk_count]
+            ends = ends[:valid_chunk_count]
+            for start, end in zip(starts, ends, strict=False):
+                ret_mask[start:end] = True
 
             to_count_down = []
-            for layer_id in range(self.num_layers):
-                task = next(get_generator)
 
-                assert task is not None
+            if valid_chunk_count > 0:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                    starts, ends, **kwargs
+                )
+                next(mem_obj_consumer)
 
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
-                else:
-                    yield None
+                for layer_id in range(self.num_layers):
+                    if layer_id == 0:
+                        # NOTE(Yuwei): For sglang integration we need to provide retrieved
+                        # tokens number in the first layer loading since there is no lookup
+                        yield torch.sum(ret_mask)
+                    else:
+                        yield None
 
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
+                    mem_objs_layer = mem_objs_layers[layer_id][:valid_chunk_count]
+                    extra_mem_objs = mem_objs_layers[layer_id][valid_chunk_count:]
+                    for extra_mem_obj in extra_mem_objs:
+                        extra_mem_obj.ref_count_down()
+
+                    mem_obj_consumer.send(mem_objs_layer)
+                    to_count_down.extend(mem_objs_layer)
+            else:
+                for mem_objs_layer in mem_objs_layers:
+                    for extra_mem_obj in mem_objs_layer:
+                        extra_mem_obj.ref_count_down()
+                for layer_id in range(self.num_layers):
+                    if layer_id == 0:
+                        yield torch.sum(ret_mask)
+                    else:
+                        yield None
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
+
+            if valid_chunk_count < len(keys):
+                logger.warning(
+                    "Layerwise retrieve truncated from %d to %d chunks due to "
+                    "backend fetch failure",
+                    len(keys),
+                    valid_chunk_count,
+                )
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -657,7 +710,8 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        if mem_obj_consumer is not None:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
