@@ -603,22 +603,8 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            location = self.storage_manager.contains(keys_multi_layer[0])
+            location = self._find_layerwise_full_chunk_backend(keys_multi_layer)
             if location is None:
-                break
-
-            all_layers_found = True
-            for key_single_layer in keys_multi_layer[1:]:
-                if (
-                    self.storage_manager.contains(
-                        key_single_layer, search_range=[location]
-                    )
-                    is None
-                ):
-                    all_layers_found = False
-                    break
-
-            if not all_layers_found:
                 break
 
             starts.append(start)
@@ -723,6 +709,81 @@ class LMCacheEngine:
 
         yield ret_mask
 
+    def _find_layerwise_full_chunk_backend(
+        self,
+        key_all_layers: list[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> Optional[str]:
+        """
+        Find a backend that has all layers for a chunk.
+
+        If `pin` is true, pinning is done only after full-layer existence
+        is confirmed in one backend.
+        """
+        normalized_search_range: Optional[list[str]]
+        if isinstance(search_range, str):
+            normalized_search_range = [search_range]
+        else:
+            normalized_search_range = search_range
+
+        storage_backends = getattr(self.storage_manager, "storage_backends", None)
+        if storage_backends is None:
+            first_backend = self.storage_manager.contains(
+                key_all_layers[0], search_range=normalized_search_range, pin=False
+            )
+            candidate_backends = [] if first_backend is None else [first_backend]
+        else:
+            if normalized_search_range is None:
+                candidate_backends = list(storage_backends.keys())
+            else:
+                search_range_set = set(normalized_search_range)
+                candidate_backends = [
+                    backend_name
+                    for backend_name in storage_backends.keys()
+                    if backend_name in search_range_set
+                ]
+
+        for backend_name in candidate_backends:
+            all_found = True
+            for key_single_layer in key_all_layers:
+                if (
+                    self.storage_manager.contains(
+                        key_single_layer, search_range=[backend_name], pin=False
+                    )
+                    is None
+                ):
+                    all_found = False
+                    break
+
+            if not all_found:
+                continue
+
+            if pin:
+                pinned_keys: list[CacheEngineKey] = []
+                pin_success = True
+                for key_single_layer in key_all_layers:
+                    if (
+                        self.storage_manager.contains(
+                            key_single_layer, search_range=[backend_name], pin=True
+                        )
+                        is None
+                    ):
+                        pin_success = False
+                        break
+                    pinned_keys.append(key_single_layer)
+
+                if not pin_success:
+                    if pinned_keys and hasattr(self.storage_manager, "batched_unpin"):
+                        self.storage_manager.batched_unpin(
+                            pinned_keys, locations=[backend_name]
+                        )
+                    continue
+
+            return backend_name
+
+        return None
+
     @_lmcache_nvtx_annotate
     def lookup(
         self,
@@ -787,28 +848,18 @@ class LMCacheEngine:
                 assert isinstance(key, CacheEngineKey)
 
                 if self.use_layerwise:
-                    # TODO(Jiayi): Optimize by checking only the existence of the key
-                    # of one layer
                     key_all_layers = key.split_layers(self.num_layers)
-
-                    found = False
-                    first_backend: Optional[str] = None
-                    for key_single_layer in key_all_layers:
-                        backend_name = self.storage_manager.contains(
-                            key_single_layer, search_range, pin
-                        )
-                        if backend_name is not None:
-                            found = True
-                            if first_backend is None:
-                                first_backend = backend_name
-                    if found:
+                    backend_name = self._find_layerwise_full_chunk_backend(
+                        key_all_layers, search_range=search_range, pin=pin
+                    )
+                    if backend_name is not None:
                         if pin:
                             self.lookup_pins[lookup_id].extend(  # type: ignore
                                 key_all_layers
                             )
-                        if tier_hit_tokens is not None and first_backend is not None:
-                            tier_hit_tokens[first_backend] = (
-                                tier_hit_tokens.get(first_backend, 0)
+                        if tier_hit_tokens is not None:
+                            tier_hit_tokens[backend_name] = (
+                                tier_hit_tokens.get(backend_name, 0)
                                 + (end - start)
                             )
                         prev_end = end

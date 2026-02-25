@@ -200,7 +200,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         mem_objs = []
         with self.cpu_lock:
             for key in keys:
-                mem_obj = self.hot_cache[key]
+                mem_obj = self.hot_cache.get(key)
+                if mem_obj is None:
+                    # Keep prefix semantics and avoid KeyError under concurrent
+                    # evictions/removals between contains() and get().
+                    break
                 mem_obj.ref_count_up()
                 mem_objs.append(mem_obj)
         return mem_objs
