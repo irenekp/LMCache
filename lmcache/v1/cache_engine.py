@@ -93,6 +93,7 @@ class LMCacheEngine:
     ):
         # Per-lookup tier hit breakdown for telemetry.
         self.lookup_tier_hit_tokens: dict[str, dict[str, int]] = {}
+        self.lookup_tier_hit_segments: dict[str, list[tuple[str, int]]] = {}
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
         self.metadata = metadata
@@ -835,8 +836,9 @@ class LMCacheEngine:
             if pin:
                 assert lookup_id is not None, "lookup_id is required when pin is True"
 
-            tier_hit_tokens: Optional[dict[str, int]] = (
-                {} if lookup_id is not None else None
+            tier_hit_tokens: Optional[dict[str, int]] = {} if lookup_id is not None else None
+            tier_hit_segments: Optional[list[tuple[str, int]]] = (
+                [] if lookup_id is not None else None
             )
 
             for start, end, key in self.token_database.process_tokens(
@@ -858,15 +860,30 @@ class LMCacheEngine:
                                 key_all_layers
                             )
                         if tier_hit_tokens is not None:
+                            hit_tokens = end - start
                             tier_hit_tokens[backend_name] = (
-                                tier_hit_tokens.get(backend_name, 0)
-                                + (end - start)
+                                tier_hit_tokens.get(backend_name, 0) + hit_tokens
                             )
+                            if tier_hit_segments is not None:
+                                if (
+                                    tier_hit_segments
+                                    and tier_hit_segments[-1][0] == backend_name
+                                ):
+                                    last_backend, last_tokens = tier_hit_segments[-1]
+                                    tier_hit_segments[-1] = (
+                                        last_backend,
+                                        last_tokens + hit_tokens,
+                                    )
+                                else:
+                                    tier_hit_segments.append((backend_name, hit_tokens))
                         prev_end = end
                         continue
                     end = prev_end
                     if lookup_id is not None and tier_hit_tokens is not None:
                         self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
+                        self.lookup_tier_hit_segments[lookup_id] = (
+                            list(tier_hit_segments or [])
+                        )
                     return prev_end
                 else:
                     backend_name = self.storage_manager.contains(
@@ -878,21 +895,37 @@ class LMCacheEngine:
                                 key
                             )
                         if tier_hit_tokens is not None:
+                            hit_tokens = end - start
                             tier_hit_tokens[backend_name] = (
-                                tier_hit_tokens.get(backend_name, 0)
-                                + (end - start)
+                                tier_hit_tokens.get(backend_name, 0) + hit_tokens
                             )
+                            if tier_hit_segments is not None:
+                                if (
+                                    tier_hit_segments
+                                    and tier_hit_segments[-1][0] == backend_name
+                                ):
+                                    last_backend, last_tokens = tier_hit_segments[-1]
+                                    tier_hit_segments[-1] = (
+                                        last_backend,
+                                        last_tokens + hit_tokens,
+                                    )
+                                else:
+                                    tier_hit_segments.append((backend_name, hit_tokens))
                         prev_end = end
                         continue
 
                     end = prev_end
                     if lookup_id is not None and tier_hit_tokens is not None:
                         self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
+                        self.lookup_tier_hit_segments[lookup_id] = (
+                            list(tier_hit_segments or [])
+                        )
                     return prev_end
 
             # all tokens where found, return the maximal end
             if lookup_id is not None and tier_hit_tokens is not None:
                 self.lookup_tier_hit_tokens[lookup_id] = tier_hit_tokens
+                self.lookup_tier_hit_segments[lookup_id] = list(tier_hit_segments or [])
             return end
         finally:
             self.stats_monitor.on_lookup_finished(end)
@@ -1126,6 +1159,7 @@ class LMCacheEngine:
     def lookup_unpin(self, lookup_ids: list[str]) -> None:
         for lookup_id in lookup_ids:
             self.lookup_tier_hit_tokens.pop(lookup_id, None)
+            self.lookup_tier_hit_segments.pop(lookup_id, None)
             if lookup_id in self.lookup_pins:
                 self.storage_manager.batched_unpin(self.lookup_pins[lookup_id])
                 del self.lookup_pins[lookup_id]

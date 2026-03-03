@@ -24,6 +24,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _normalize_tier_segments(raw: object) -> list[tuple[str, int]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[str, int]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        backend_name, token_count = item
+        if not isinstance(backend_name, str):
+            continue
+        if not isinstance(token_count, int) or token_count <= 0:
+            continue
+        out.append((backend_name, int(token_count)))
+    return out
+
+
+def _truncate_tier_segments(
+    segments: list[tuple[str, int]],
+    limit_tokens: int,
+) -> list[tuple[str, int]]:
+    if limit_tokens <= 0:
+        return []
+    out: list[tuple[str, int]] = []
+    remaining = int(limit_tokens)
+    for backend_name, token_count in segments:
+        if remaining <= 0:
+            break
+        take = min(int(token_count), remaining)
+        if take <= 0:
+            continue
+        if out and out[-1][0] == backend_name:
+            last_backend, last_tokens = out[-1]
+            out[-1] = (last_backend, last_tokens + take)
+        else:
+            out.append((backend_name, take))
+        remaining -= take
+    return out
+
+
 class LMCacheLookupClient(LookupClientInterface):
     """
     ZMQ-based lookup client that communicates with a lookup server.
@@ -96,6 +135,7 @@ class LMCacheLookupClient(LookupClientInterface):
             self.token_database = ChunkedTokenDatabase(config, metadata)
 
         self.reqs_tier_stats: dict[str, dict[str, int]] = {}
+        self.reqs_tier_segments: dict[str, list[tuple[str, int]]] = {}
 
     # FIXME(Jiayi): Cacheblend need token ids
     def lookup(
@@ -141,6 +181,7 @@ class LMCacheLookupClient(LookupClientInterface):
 
         results = []
         tier_results: list[dict[str, int]] = []
+        tier_segment_results: list[list[tuple[str, int]]] = []
         try:
             for i in range(ranks):
                 self.sockets[i].send_multipart(msg_buf, copy=False)
@@ -151,6 +192,7 @@ class LMCacheLookupClient(LookupClientInterface):
                 if not parts:
                     results.append(0)
                     tier_results.append({})
+                    tier_segment_results.append([])
                     continue
                 result = int.from_bytes(parts[0].bytes, "big")
                 results.append(result)
@@ -164,6 +206,16 @@ class LMCacheLookupClient(LookupClientInterface):
                 else:
                     tier = {}
                 tier_results.append(tier)
+                if len(parts) >= 3:
+                    try:
+                        tier_segments = _normalize_tier_segments(
+                            msgspec.msgpack.decode(parts[2].bytes)
+                        )
+                    except Exception:
+                        tier_segments = []
+                else:
+                    tier_segments = []
+                tier_segment_results.append(tier_segments)
         except zmq.Again:
             logger.error(f"Timeout occurred for rank {i}")
             return 0
@@ -189,14 +241,28 @@ class LMCacheLookupClient(LookupClientInterface):
             vals = [d.get(k, 0) for d in tier_results]
             min_by[k] = min(vals) if vals else 0
         self.reqs_tier_stats[lookup_id] = min_by
+        min_idx = results.index(num_hit_toks)
+        chosen_segments = (
+            tier_segment_results[min_idx] if min_idx < len(tier_segment_results) else []
+        )
+        self.reqs_tier_segments[lookup_id] = _truncate_tier_segments(
+            chosen_segments,
+            num_hit_toks,
+        )
 
         return num_hit_toks
 
     def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
         return self.reqs_tier_stats.get(lookup_id)
 
+    def get_tier_segments(
+        self, lookup_id: str
+    ) -> Optional[list[tuple[str, int]]]:
+        return self.reqs_tier_segments.get(lookup_id)
+
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_tier_stats.pop(lookup_id, None)
+        self.reqs_tier_segments.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -274,7 +340,13 @@ class LMCacheLookupServer:
                     lookup_id, {}
                 )
                 tier_stats_bytes = msgspec.msgpack.encode(tier_stats)
-                self.socket.send_multipart([response, tier_stats_bytes])
+                tier_segments = self.lmcache_engine.lookup_tier_hit_segments.get(
+                    lookup_id, []
+                )
+                tier_segments_bytes = msgspec.msgpack.encode(tier_segments)
+                self.socket.send_multipart(
+                    [response, tier_stats_bytes, tier_segments_bytes]
+                )
 
         logger.info(f"lmcache lookup server start on {socket_path}")
         self.thread = threading.Thread(target=process_request, daemon=True)

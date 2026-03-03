@@ -43,6 +43,20 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
         """Close the lookup client and clean up resources."""
         raise NotImplementedError
 
+    def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
+        """Return per-tier aggregate lookup stats if available."""
+        return None
+
+    def get_tier_segments(
+        self, lookup_id: str
+    ) -> Optional[list[tuple[str, int]]]:
+        """Return ordered per-tier lookup segments if available."""
+        return None
+
+    def clear_lookup_status(self, lookup_id: str) -> None:
+        """Clear any cached lookup bookkeeping."""
+        return None
+
     def supports_producer_reuse(self) -> bool:
         """
         Return whether this lookup client supports producer KV cache reuse.

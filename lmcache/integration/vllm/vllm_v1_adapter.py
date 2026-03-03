@@ -84,6 +84,123 @@ def _split_tier_stats(tier_stats: Any) -> dict[str, int]:
     return dict(tier_stats)
 
 
+def _normalize_tier_segments(tier_segments: Any) -> list[tuple[str, int]]:
+    if not isinstance(tier_segments, list):
+        return []
+    out: list[tuple[str, int]] = []
+    for item in tier_segments:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        backend_name, token_count = item
+        if not isinstance(backend_name, str):
+            continue
+        if not isinstance(token_count, int) or token_count <= 0:
+            continue
+        out.append((backend_name, int(token_count)))
+    return out
+
+
+def _clip_tier_segments_to_interval(
+    tier_segments: list[tuple[str, int]],
+    *,
+    start_offset: int,
+    end_offset: int,
+) -> dict[str, int]:
+    if end_offset <= start_offset:
+        return {}
+    by_tier: dict[str, int] = {}
+    cursor = 0
+    for backend_name, token_count in tier_segments:
+        seg_start = cursor
+        seg_end = cursor + int(token_count)
+        overlap_start = max(seg_start, int(start_offset))
+        overlap_end = min(seg_end, int(end_offset))
+        if overlap_end > overlap_start:
+            by_tier[backend_name] = (
+                by_tier.get(backend_name, 0) + (overlap_end - overlap_start)
+            )
+        cursor = seg_end
+        if cursor >= end_offset:
+            break
+    return {str(k): int(v) for k, v in by_tier.items() if int(v) > 0}
+
+
+def _fallback_tier_accounting(
+    *,
+    aggregate_tiers: Optional[dict[str, int]],
+    host_fetched_tokens: int,
+) -> dict[str, int]:
+    host_fetched_tokens = int(host_fetched_tokens)
+    if host_fetched_tokens <= 0:
+        return {}
+
+    normalized = {
+        str(k): int(v)
+        for k, v in (aggregate_tiers or {}).items()
+        if int(v) > 0
+    }
+    if not normalized:
+        return {"external": host_fetched_tokens}
+    if len(normalized) == 1:
+        tier_name = next(iter(normalized))
+        return {tier_name: host_fetched_tokens}
+
+    total = sum(normalized.values())
+    if total <= 0:
+        return {"external": host_fetched_tokens}
+
+    out: dict[str, int] = {}
+    remaining = host_fetched_tokens
+    items = list(normalized.items())
+    for idx, (tier_name, token_count) in enumerate(items):
+        if idx == len(items) - 1:
+            alloc = remaining
+        else:
+            alloc = min(
+                remaining,
+                (host_fetched_tokens * int(token_count)) // int(total),
+            )
+        if alloc > 0:
+            out[tier_name] = alloc
+            remaining -= alloc
+    if remaining > 0:
+        last_tier = items[-1][0]
+        out[last_tier] = out.get(last_tier, 0) + remaining
+    return {k: v for k, v in out.items() if v > 0}
+
+
+def _build_cache_accounting(
+    *,
+    load_spec: "LoadSpec",
+    host_fetched_tokens: int,
+) -> dict[str, Any]:
+    gpu_resident_tokens = max(0, int(load_spec.vllm_cached_tokens))
+    host_fetched_tokens = max(0, int(host_fetched_tokens))
+    clipped = _clip_tier_segments_to_interval(
+        list(load_spec.lmcache_tier_hit_segments or []),
+        start_offset=gpu_resident_tokens,
+        end_offset=gpu_resident_tokens + host_fetched_tokens,
+    )
+    clipped_total = sum(clipped.values())
+    if clipped_total != host_fetched_tokens:
+        if clipped and clipped_total < host_fetched_tokens:
+            last_tier = next(reversed(clipped))
+            clipped[last_tier] += host_fetched_tokens - clipped_total
+        else:
+            clipped = _fallback_tier_accounting(
+                aggregate_tiers=load_spec.lmcache_tier_hit_tokens,
+                host_fetched_tokens=host_fetched_tokens,
+            )
+
+    total_cached_tokens = gpu_resident_tokens + host_fetched_tokens
+    return {
+        "gpu_resident_tokens": gpu_resident_tokens,
+        "host_fetched_tokens": host_fetched_tokens,
+        "host_fetched_tokens_by_tier": clipped,
+        "total_cached_tokens": total_cached_tokens,
+    }
+
+
 def _normalize_block_hash_for_kv_events(block_hash: Any) -> Any:
     # vLLM KV cache manager emits hashes via maybe_convert_block_hash(...)
     # (int by default). Keep connector-side hashes in the same representation.
@@ -105,6 +222,7 @@ class LoadSpec:
     # True if vLLM forces recomputing last token in the full-hit case.
     recalc_last_token: bool = False
     lmcache_tier_hit_tokens: Optional[dict[str, int]] = None
+    lmcache_tier_hit_segments: Optional[list[tuple[str, int]]] = None
 
 
 @dataclass
@@ -1398,9 +1516,13 @@ class LMCacheConnectorV1Impl:
             request_configs=request_configs,
         )
         tier_min: dict[str, int] = {}
-        if hasattr(self.lookup_client, "get_tier_stats"):
-            tier_stats = self.lookup_client.get_tier_stats(lookup_id)
+        tier_segments: list[tuple[str, int]] = []
+        tier_stats = self.lookup_client.get_tier_stats(lookup_id)
+        if tier_stats is not None:
             tier_min = _split_tier_stats(tier_stats)
+        tier_segments_raw = self.lookup_client.get_tier_segments(lookup_id)
+        if tier_segments_raw is not None:
+            tier_segments = _normalize_tier_segments(tier_segments_raw)
 
         if num_external_hit_tokens is None:
             logger.info(
@@ -1436,6 +1558,7 @@ class LMCacheConnectorV1Impl:
             lookup_prompt_len=lookup_prompt_len,
             recalc_last_token=recalc_last_token,
             lmcache_tier_hit_tokens=tier_min or None,
+            lmcache_tier_hit_segments=tier_segments or None,
         )
         try:
             kv_params = getattr(request, "kv_transfer_params", None)
@@ -1443,18 +1566,22 @@ class LMCacheConnectorV1Impl:
                 kv_params = {}
                 setattr(request, "kv_transfer_params", kv_params)
             kv_params["_lmcache_telemetry"] = {
-                "vllm_cached_tokens": int(num_computed_tokens),
-                "lmcache_cached_tokens": int(num_external_hit_tokens),
-                "lookup_prompt_len": int(lookup_prompt_len),
-                "recalc_last_token": bool(recalc_last_token),
-                "lmcache_tier_hit_tokens": dict(tier_min) if tier_min else None,
+                "lookup": {
+                    "vllm_cached_tokens": int(num_computed_tokens),
+                    "lmcache_cached_tokens": int(num_external_hit_tokens),
+                    "lookup_prompt_len": int(lookup_prompt_len),
+                    "recalc_last_token": bool(recalc_last_token),
+                    "lmcache_tier_hit_tokens": dict(tier_min) if tier_min else None,
+                    "lmcache_tier_hit_segments": (
+                        list(tier_segments) if tier_segments else None
+                    ),
+                },
+                "cache_accounting": None,
             }
         except Exception:
             logger.exception("Failed to attach _lmcache_telemetry to request.")
 
-        if (not self.async_loading) and hasattr(
-            self.lookup_client, "clear_lookup_status"
-        ):
+        if not self.async_loading:
             self.lookup_client.clear_lookup_status(lookup_id)
 
         if need_to_allocate <= 0:
@@ -1474,8 +1601,7 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
-        if hasattr(self.lookup_client, "clear_lookup_status"):
-            self.lookup_client.clear_lookup_status(request.request_id)
+        self.lookup_client.clear_lookup_status(request.request_id)
 
         kv_transfer_params = (
             request.kv_transfer_params
@@ -1508,6 +1634,13 @@ class LMCacheConnectorV1Impl:
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            if isinstance(kv_transfer_params, dict):
+                telemetry = kv_transfer_params.get("_lmcache_telemetry")
+                if isinstance(telemetry, dict):
+                    telemetry["cache_accounting"] = _build_cache_accounting(
+                        load_spec=self.load_specs[request.request_id],
+                        host_fetched_tokens=0,
+                    )
             return
 
         recalc_last = 1 if self.load_specs[request.request_id].recalc_last_token else 0
@@ -1525,6 +1658,13 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        if isinstance(kv_transfer_params, dict):
+            telemetry = kv_transfer_params.get("_lmcache_telemetry")
+            if isinstance(telemetry, dict):
+                telemetry["cache_accounting"] = _build_cache_accounting(
+                    load_spec=self.load_specs[request.request_id],
+                    host_fetched_tokens=int(num_external_tokens),
+                )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -1682,9 +1822,12 @@ class LMCacheConnectorV1Impl:
                 request.kv_transfer_params.pop("_lmcache_telemetry", None)
             return False, return_params
 
-        gpu_hit_tokens = 0
-        lmcache_by_tier: dict[str, int] = {}
-        total_cache_tokens = 0
+        cache_accounting: dict[str, Any] = {
+            "gpu_resident_tokens": 0,
+            "host_fetched_tokens": 0,
+            "host_fetched_tokens_by_tier": {},
+            "total_cached_tokens": 0,
+        }
 
         req_id = request.request_id
         load_spec = self.load_specs.pop(req_id, None)
@@ -1693,38 +1836,60 @@ class LMCacheConnectorV1Impl:
         if isinstance(kv_params, dict):
             telemetry = kv_params.get("_lmcache_telemetry")
 
-        if load_spec is not None:
-            gpu_hit_tokens = int(load_spec.vllm_cached_tokens)
-            if load_spec.lmcache_tier_hit_tokens is not None:
-                lmcache_by_tier = dict(load_spec.lmcache_tier_hit_tokens)
-            if load_spec.recalc_last_token and lmcache_by_tier:
-                max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
-                lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
-            total_cache_tokens = gpu_hit_tokens + sum(lmcache_by_tier.values())
-        elif isinstance(telemetry, dict):
-            gpu_hit_tokens = int(telemetry.get("vllm_cached_tokens", 0) or 0)
-            tier_min = telemetry.get("lmcache_tier_hit_tokens")
-            if isinstance(tier_min, dict):
-                lmcache_by_tier = dict(tier_min)
-            if telemetry.get("recalc_last_token", False) and lmcache_by_tier:
-                max_k = max(lmcache_by_tier, key=lambda k: lmcache_by_tier[k])
-                lmcache_by_tier[max_k] = max(0, lmcache_by_tier[max_k] - 1)
-            total_cache_tokens = gpu_hit_tokens + sum(lmcache_by_tier.values())
+        if isinstance(telemetry, dict):
+            public_cache_accounting = telemetry.get("cache_accounting")
+            if isinstance(public_cache_accounting, dict):
+                cache_accounting = {
+                    "gpu_resident_tokens": int(
+                        public_cache_accounting.get("gpu_resident_tokens", 0) or 0
+                    ),
+                    "host_fetched_tokens": int(
+                        public_cache_accounting.get("host_fetched_tokens", 0) or 0
+                    ),
+                    "host_fetched_tokens_by_tier": {
+                        str(k): int(v)
+                        for k, v in (
+                            public_cache_accounting.get(
+                                "host_fetched_tokens_by_tier"
+                            )
+                            or {}
+                        ).items()
+                        if int(v) > 0
+                    },
+                    "total_cached_tokens": int(
+                        public_cache_accounting.get("total_cached_tokens", 0) or 0
+                    ),
+                }
+        if load_spec is not None and not cache_accounting["total_cached_tokens"]:
+            recalc_last = 1 if load_spec.recalc_last_token else 0
+            host_fetched_tokens = max(
+                0,
+                int(load_spec.lmcache_cached_tokens)
+                - int(load_spec.vllm_cached_tokens)
+                - recalc_last,
+            )
+            cache_accounting = _build_cache_accounting(
+                load_spec=load_spec,
+                host_fetched_tokens=host_fetched_tokens,
+            )
 
         if return_params is None:
             return_params = {}
-        host_hit_tokens_by_tier = {
-            str(k): int(v) for k, v in lmcache_by_tier.items() if int(v) > 0
-        }
-        host_hit_tokens = int(sum(host_hit_tokens_by_tier.values()))
-        total_cache_tokens = int(gpu_hit_tokens) + host_hit_tokens
         return_params.update(
             {
                 "cache_hit": {
-                    "gpu_hit_tokens": int(gpu_hit_tokens),
-                    "host_hit_tokens": host_hit_tokens,
-                    "host_hit_tokens_by_tier": host_hit_tokens_by_tier,
-                    "total_cache_tokens": total_cache_tokens,
+                    "gpu_resident_tokens": int(
+                        cache_accounting["gpu_resident_tokens"]
+                    ),
+                    "host_fetched_tokens": int(
+                        cache_accounting["host_fetched_tokens"]
+                    ),
+                    "host_fetched_tokens_by_tier": dict(
+                        cache_accounting["host_fetched_tokens_by_tier"]
+                    ),
+                    "total_cached_tokens": int(
+                        cache_accounting["total_cached_tokens"]
+                    ),
                 }
             }
         )

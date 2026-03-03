@@ -24,6 +24,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _normalize_tier_segments(raw: object) -> list[tuple[str, int]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[tuple[str, int]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        backend_name, token_count = item
+        if not isinstance(backend_name, str):
+            continue
+        if not isinstance(token_count, int) or token_count <= 0:
+            continue
+        out.append((backend_name, int(token_count)))
+    return out
+
+
+def _truncate_tier_segments(
+    segments: list[tuple[str, int]],
+    limit_tokens: int,
+) -> list[tuple[str, int]]:
+    if limit_tokens <= 0:
+        return []
+    out: list[tuple[str, int]] = []
+    remaining = int(limit_tokens)
+    for backend_name, token_count in segments:
+        if remaining <= 0:
+            break
+        take = min(int(token_count), remaining)
+        if take <= 0:
+            continue
+        if out and out[-1][0] == backend_name:
+            last_backend, last_tokens = out[-1]
+            out[-1] = (last_backend, last_tokens + take)
+        else:
+            out.append((backend_name, take))
+        remaining -= take
+    return out
+
+
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
 # workers has different hit tokens.
 class LMCacheAsyncLookupClient(LookupClientInterface):
@@ -112,12 +151,15 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # int indicates number of hit tokens.
         self.reqs_status: dict[str, Optional[int]] = {}
         self.reqs_tier_stats: dict[str, dict[str, int]] = {}
+        self.reqs_tier_segments: dict[str, list[tuple[str, int]]] = {}
 
         # map from lookup_id to number of hit tokens for each worker
         self.res_for_each_worker: dict[str, list[int]] = {}
         self.tier_for_each_worker: dict[str, list[dict[str, int]]] = {}
+        self.segments_for_each_worker: dict[str, list[list[tuple[str, int]]]] = {}
 
-        # The parts are [lookup_id, num_hit_tokens, (optional) tier_stats]
+        # The required parts are [lookup_id, num_hit_tokens], with optional
+        # per-tier aggregates and ordered tier segments appended after that.
         self.num_parts = 2
 
         self.running = True
@@ -200,6 +242,15 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     )
                 except Exception:
                     tier_stats = {}
+            if len(frames) >= 4:
+                try:
+                    tier_segments = _normalize_tier_segments(
+                        msgspec.msgpack.decode(frames[3].bytes)
+                    )
+                except Exception:
+                    tier_segments = []
+            else:
+                tier_segments = []
 
             with self.lock:
                 if lookup_id not in self.res_for_each_worker:
@@ -214,6 +265,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     self.tier_for_each_worker[lookup_id].append(tier_stats)
                 all_tiers = self.tier_for_each_worker[lookup_id]
 
+                if lookup_id not in self.segments_for_each_worker:
+                    self.segments_for_each_worker[lookup_id] = [tier_segments]
+                else:
+                    self.segments_for_each_worker[lookup_id].append(tier_segments)
+                all_segments = self.segments_for_each_worker[lookup_id]
+
                 expected = (
                     1
                     if self.create_lookup_server_only_on_worker_0_for_mla
@@ -222,12 +279,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 if len(all_res) == expected:
                     self.res_for_each_worker.pop(lookup_id, None)
                     self.tier_for_each_worker.pop(lookup_id, None)
+                    self.segments_for_each_worker.pop(lookup_id, None)
 
                     # NOTE: it is possible that the number of hit
                     # tokens is different across TP ranks, so we
                     # can use the minimum value as the number of
                     # hit tokens.
-                    self.reqs_status[lookup_id] = min(all_res)
+                    min_hit_tokens = min(all_res)
+                    self.reqs_status[lookup_id] = min_hit_tokens
                     min_by: dict[str, int] = {}
                     all_keys = set()
                     for d in all_tiers:
@@ -236,17 +295,33 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         vals = [d.get(k, 0) for d in all_tiers]
                         min_by[k] = min(vals) if vals else 0
                     self.reqs_tier_stats[lookup_id] = min_by
+                    min_idx = all_res.index(min_hit_tokens)
+                    chosen_segments = (
+                        all_segments[min_idx] if min_idx < len(all_segments) else []
+                    )
+                    self.reqs_tier_segments[lookup_id] = _truncate_tier_segments(
+                        chosen_segments,
+                        min_hit_tokens,
+                    )
 
     def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
         with self.lock:
             return self.reqs_tier_stats.get(lookup_id)
 
+    def get_tier_segments(
+        self, lookup_id: str
+    ) -> Optional[list[tuple[str, int]]]:
+        with self.lock:
+            return self.reqs_tier_segments.get(lookup_id)
+
     def clear_lookup_status(self, lookup_id: str) -> None:
         with self.lock:
             self.reqs_status.pop(lookup_id, None)
             self.reqs_tier_stats.pop(lookup_id, None)
+            self.reqs_tier_segments.pop(lookup_id, None)
             self.res_for_each_worker.pop(lookup_id, None)
             self.tier_for_each_worker.pop(lookup_id, None)
+            self.segments_for_each_worker.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
@@ -348,8 +423,11 @@ class LMCacheAsyncLookupServer:
         num_hit_tokens_buf = num_hit_tokens.to_bytes(4, "big")
         tier_stats = self.lmcache_engine.lookup_tier_hit_tokens.get(lookup_id, {})
         tier_stats_buf = msgspec.msgpack.encode(tier_stats)
+        tier_segments = self.lmcache_engine.lookup_tier_hit_segments.get(lookup_id, [])
+        tier_segments_buf = msgspec.msgpack.encode(tier_segments)
         self.push_socket.send_multipart(
-            [lookup_id_buf, num_hit_tokens_buf, tier_stats_buf], copy=False
+            [lookup_id_buf, num_hit_tokens_buf, tier_stats_buf, tier_segments_buf],
+            copy=False,
         )
 
     def close(self):

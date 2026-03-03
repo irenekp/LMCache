@@ -69,5 +69,16 @@ class HitLimitLookupClient(LookupClientInterface):
     def supports_producer_reuse(self) -> bool:
         return self.actual_lookup_client.supports_producer_reuse()
 
+    def get_tier_stats(self, lookup_id: str) -> Optional[dict[str, int]]:
+        return self.actual_lookup_client.get_tier_stats(lookup_id)
+
+    def get_tier_segments(
+        self, lookup_id: str
+    ) -> Optional[list[tuple[str, int]]]:
+        return self.actual_lookup_client.get_tier_segments(lookup_id)
+
+    def clear_lookup_status(self, lookup_id: str) -> None:
+        self.actual_lookup_client.clear_lookup_status(lookup_id)
+
     def close(self) -> None:
         self.actual_lookup_client.close()
