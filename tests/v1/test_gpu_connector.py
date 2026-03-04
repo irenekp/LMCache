@@ -294,6 +294,131 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu):
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
 )
+def test_layerwise_vllm_paged_connector_sparse_store_with_gpu(use_gpu):
+    num_blocks = 64
+    block_size = 16
+    num_layers = 4
+    num_heads = 8
+    head_size = 128
+    device = "cuda"
+    hidden_dim = num_heads * head_size
+
+    chunk_size = 256
+    num_tokens = chunk_size * 3
+
+    allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+
+    gpu_kv_src = generate_kv_cache_paged_list_tensors(num_blocks, device, block_size)
+    dtype = gpu_kv_src[0][0].dtype
+
+    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
+
+    connector = VLLMPagedMemLayerwiseGPUConnector(
+        hidden_dim,
+        num_layers,
+        use_gpu=use_gpu,
+        chunk_size=chunk_size,
+        dtype=dtype,
+        device=device,
+    )
+
+    def allocate_layerwise_memory_objs(ranges):
+        memory_objs = []
+        for start, end in ranges:
+            shape_single_layer = connector.get_shape(end - start)
+            memory_objs_multi_layer = []
+
+            for _ in range(num_layers):
+                mem_obj_single_layer = allocator.allocate(
+                    shape_single_layer, dtype, fmt=MemoryFormat.KV_T2D
+                )
+                memory_objs_multi_layer.append(mem_obj_single_layer)
+
+            memory_objs.append(memory_objs_multi_layer)
+
+        return [list(row) for row in zip(*memory_objs, strict=False)]
+
+    def exhaust_batched_from_gpu(memory_objs, starts, ends):
+        mem_obj_generator = connector.batched_from_gpu(
+            memory_objs,
+            starts,
+            ends,
+            kvcaches=gpu_kv_src,
+            slot_mapping=slot_mapping,
+            sync=True,
+        )
+
+        for _ in range(num_layers + 1):
+            next(mem_obj_generator)
+
+    def free_layerwise_memory_objs(memory_objs):
+        for mem_obj_multi_layer in memory_objs:
+            for mem_obj in mem_obj_multi_layer:
+                mem_obj.ref_count_down()
+
+    first_chunk_ranges = [(0, chunk_size)]
+    last_chunk_ranges = [(chunk_size * 2, chunk_size * 3)]
+    sparse_ranges = [(0, chunk_size), (chunk_size * 2, chunk_size * 3)]
+    contiguous_ranges = [
+        (0, chunk_size),
+        (chunk_size, chunk_size * 2),
+        (chunk_size * 2, chunk_size * 3),
+    ]
+
+    first_chunk_memory_objs = allocate_layerwise_memory_objs(first_chunk_ranges)
+    last_chunk_memory_objs = allocate_layerwise_memory_objs(last_chunk_ranges)
+    sparse_memory_objs = allocate_layerwise_memory_objs(sparse_ranges)
+    contiguous_memory_objs = allocate_layerwise_memory_objs(contiguous_ranges)
+
+    exhaust_batched_from_gpu(first_chunk_memory_objs, [0], [chunk_size])
+    exhaust_batched_from_gpu(
+        last_chunk_memory_objs, [chunk_size * 2], [chunk_size * 3]
+    )
+    exhaust_batched_from_gpu(
+        sparse_memory_objs,
+        [start for start, _ in sparse_ranges],
+        [end for _, end in sparse_ranges],
+    )
+    exhaust_batched_from_gpu(
+        contiguous_memory_objs,
+        [start for start, _ in contiguous_ranges],
+        [end for _, end in contiguous_ranges],
+    )
+
+    for layer_id in range(num_layers):
+        assert torch.equal(
+            sparse_memory_objs[layer_id][0].tensor,
+            first_chunk_memory_objs[layer_id][0].tensor,
+        )
+        assert torch.equal(
+            sparse_memory_objs[layer_id][1].tensor,
+            last_chunk_memory_objs[layer_id][0].tensor,
+        )
+        assert torch.equal(
+            contiguous_memory_objs[layer_id][0].tensor,
+            first_chunk_memory_objs[layer_id][0].tensor,
+        )
+        assert torch.equal(
+            contiguous_memory_objs[layer_id][2].tensor,
+            last_chunk_memory_objs[layer_id][0].tensor,
+        )
+
+    free_layerwise_memory_objs(first_chunk_memory_objs)
+    free_layerwise_memory_objs(last_chunk_memory_objs)
+    free_layerwise_memory_objs(sparse_memory_objs)
+    free_layerwise_memory_objs(contiguous_memory_objs)
+
+    assert allocator.memcheck()
+    assert connector.gpu_buffer_allocator.memcheck()
+
+    allocator.close()
+
+
+@pytest.mark.parametrize("use_gpu", [True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
+)
 def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
     num_blocks = 100
     block_size = 16

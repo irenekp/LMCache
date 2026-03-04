@@ -1063,9 +1063,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
+        packed_ranges = []
+        packed_cursor = 0
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
+            chunk_len = end - start
             slot_mapping_chunks.append(slot_mapping[start:end])
+            packed_ranges.append((packed_cursor, packed_cursor + chunk_len))
+            packed_cursor += chunk_len
 
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
@@ -1084,7 +1089,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
-        offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
@@ -1101,13 +1105,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         True,
                         self.vllm_two_major,
                     )
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
+                for (buf_start, buf_end), start, end, memory_obj in zip(
+                    packed_ranges, starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.tensor is not None
                     if self.use_gpu:
                         memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
+                            tmp_gpu_buffer_obj.tensor[buf_start:buf_end],
                             non_blocking=True,
                         )
                     else:
