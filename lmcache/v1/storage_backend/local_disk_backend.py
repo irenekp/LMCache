@@ -42,6 +42,7 @@ class LocalDiskWorker:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.put_lock = threading.Lock()
         self.put_tasks: List[CacheEngineKey] = []
+        self.config = config
 
         self.prefetch_lock = threading.Lock()
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
@@ -438,6 +439,7 @@ class LocalDiskBackend(StorageBackendInterface):
         return await self.disk_worker.submit_task(
             "prefetch",
             self.batched_async_load_bytes_from_disk,
+            lookup_id=lookup_id,
             paths=paths,
             keys=keys,
             memory_objs=mem_objs,
@@ -507,6 +509,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def batched_async_load_bytes_from_disk(
         self,
+        lookup_id: str,
         paths: list[str],
         keys: list[CacheEngineKey],
         memory_objs: list[MemoryObj],
@@ -518,14 +521,26 @@ class LocalDiskBackend(StorageBackendInterface):
 
         logger.debug("Executing `async_load_bytes` from disk.")
         # TODO (Jiayi): handle the case where loading fails.
+        total_loaded_bytes = 0
+        num_loaded_keys = 0
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
+            is_loaded = self.read_file(key, buffer, path)
+            if is_loaded:
+                total_loaded_bytes += len(buffer)
+                num_loaded_keys += 1
 
             self.disk_lock.acquire()
             self.dict[key].unpin()
             self.disk_lock.release()
 
+        logger.info(
+            "lookup_id: %s; Loaded %d/%d keys from local disk (%d bytes).",
+            lookup_id,
+            num_loaded_keys,
+            len(keys),
+            total_loaded_bytes,
+        )
         return memory_objs
 
     def load_bytes_from_disk(
@@ -544,7 +559,15 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+        is_loaded = self.read_file(key, buffer, path)
+        if not is_loaded:
+            logger.warning("Failed to load key %s from local disk path %s", key, path)
+        else:
+            logger.info(
+                "Loaded key %s from local disk: %d bytes",
+                key,
+                len(buffer),
+            )
         return memory_obj
 
     def write_file(self, buffer, path):
@@ -563,7 +586,7 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
         )
 
-    def read_file(self, key, buffer, path):
+    def read_file(self, key, buffer, path) -> bool:
         start_time = time.time()
         size = len(buffer)
         fblock_aligned = size % self.os_disk_bs == 0
@@ -584,13 +607,14 @@ class LocalDiskBackend(StorageBackendInterface):
         except FileNotFoundError:
             if self.dict.get(key, None):
                 self.dict.pop(key)
-            return
+            return False
 
         disk_read_time = time.time() - start_time
         logger.debug(
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
+        return True
 
     def get_allocator_backend(self):
         return self.local_cpu_backend
