@@ -831,9 +831,9 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
         self._requests_priority: dict[str, int] = {}
-        # Map LMCache chunk hash to vLLM block hash for duplication tracking.
-        self._hash_translation: dict[int, Any] = {}
-        self._hash_translation_sizes: dict[int, int] = {}
+        # Map LMCache chunk hash to the covered vLLM block hash(es) and token size.
+        self._hash_translation: dict[Any, list[Any]] = {}
+        self._hash_translation_sizes: dict[Any, int] = {}
         self._hash_translation_lock = threading.Lock()
         self._debug_hash_translation = _env_flag(
             "LMCACHE_DEBUG_HASH_TRANSLATION", False
@@ -1323,13 +1323,22 @@ class LMCacheConnectorV1Impl:
         with self._hash_translation_lock:
             for start, end, lm_hash in entries:
                 entries_total += 1
-                block_idx = start // self._lmcache_chunk_size
-                if block_idx >= len(block_hashes):
+                if end <= start:
                     skipped += 1
                     continue
-                self._hash_translation[lm_hash] = _normalize_block_hash_for_kv_events(
-                    block_hashes[block_idx]
-                )
+                block_start_idx = start // self._block_size
+                block_end_idx = cdiv(end, self._block_size)
+                if block_end_idx > len(block_hashes):
+                    skipped += 1
+                    continue
+                translated_hashes = [
+                    _normalize_block_hash_for_kv_events(bh)
+                    for bh in block_hashes[block_start_idx:block_end_idx]
+                ]
+                if not translated_hashes:
+                    skipped += 1
+                    continue
+                self._hash_translation[lm_hash] = translated_hashes
                 self._hash_translation_sizes[lm_hash] = end - start
                 mapped += 1
 
@@ -1357,9 +1366,10 @@ class LMCacheConnectorV1Impl:
             misses = 0
             sample_misses: list[Any] = []
             for h in hashes:
-                if h in self._hash_translation:
+                mapped_hashes = self._hash_translation.get(h)
+                if mapped_hashes:
                     hits += 1
-                    translated.append(self._hash_translation[h])
+                    translated.extend(mapped_hashes)
                 else:
                     misses += 1
                     translated.append(h)
@@ -1394,22 +1404,67 @@ class LMCacheConnectorV1Impl:
                     len(self._hash_translation),
                 )
 
-    def _translated_block_size_from_lm_hashes(
+    def _translate_kv_hash_groups(
         self,
-        lm_hashes: list[Any],
-        fallback: int,
-    ) -> int:
-        if not lm_hashes:
-            return fallback
+        hashes: list[Any],
+        fallback_block_size: int,
+    ) -> list[tuple[list[Any], int]]:
+        """
+        Translate LMCache hashes into vLLM hashes and normalize token units.
+
+        The returned groups preserve order and merge adjacent ranges that share
+        the same per-hash block_size.
+        """
+        if not hashes:
+            return []
+
+        groups: list[tuple[list[Any], int]] = []
         with self._hash_translation_lock:
-            sizes = [
-                self._hash_translation_sizes.get(h)
-                for h in lm_hashes
-            ]
-        known = [s for s in sizes if isinstance(s, int) and s > 0]
-        if not known:
-            return fallback
-        return int(sum(known))
+            hits = 0
+            misses = 0
+            sample_misses: list[Any] = []
+            for h in hashes:
+                mapped_hashes = self._hash_translation.get(h)
+                token_count = self._hash_translation_sizes.get(h)
+
+                if mapped_hashes:
+                    hits += 1
+                    per_hash_block_size = int(fallback_block_size)
+                    if (
+                        isinstance(token_count, int)
+                        and token_count > 0
+                        and token_count % len(mapped_hashes) == 0
+                    ):
+                        per_hash_block_size = token_count // len(mapped_hashes)
+                    else:
+                        # Keep telemetry self-consistent: when we cannot infer
+                        # a per-block size, fall back to one representative hash.
+                        mapped_hashes = [mapped_hashes[0]]
+                    translated_hashes = list(mapped_hashes)
+                else:
+                    misses += 1
+                    per_hash_block_size = int(fallback_block_size)
+                    translated_hashes = [h]
+                    if len(sample_misses) < 4:
+                        sample_misses.append(h)
+
+                if groups and groups[-1][1] == per_hash_block_size:
+                    groups[-1][0].extend(translated_hashes)
+                else:
+                    groups.append((translated_hashes, per_hash_block_size))
+
+            if self._debug_hash_translation:
+                logger.info(
+                    "[dup-debug] hash translate: total=%d hits=%d misses=%d "
+                    "groups=%d map_size=%d sample_misses=%s",
+                    len(hashes),
+                    hits,
+                    misses,
+                    len(groups),
+                    len(self._hash_translation),
+                    sample_misses,
+                )
+        return groups
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> list[CacheStoreEvent | CacheEvictEvent]:
@@ -1429,34 +1484,46 @@ class LMCacheConnectorV1Impl:
             )
         translated: list[CacheStoreEvent | CacheEvictEvent] = []
         for event in events:
-            translated_hashes = self._translate_kv_hashes(event.block_hashes)
-            translated_block_size = self._translated_block_size_from_lm_hashes(
+            translated_groups = self._translate_kv_hash_groups(
                 event.block_hashes,
                 int(event.block_size),
             )
             if hasattr(event, "parent_block_hash"):
                 parent_hash = event.parent_block_hash
                 if parent_hash is not None:
-                    parent_hash = self._translate_kv_hashes([parent_hash])[0]
-                translated.append(
-                    CacheStoreEvent(
-                        block_hashes=translated_hashes,
-                        parent_block_hash=parent_hash,
-                        token_ids=event.token_ids,
-                        block_size=translated_block_size,
-                        lora_id=getattr(event, "lora_id", None),
-                        medium=event.medium,
-                        lora_name=getattr(event, "lora_name", None),
+                    translated_parent_hashes = self._translate_kv_hashes([parent_hash])
+                    if translated_parent_hashes:
+                        parent_hash = translated_parent_hashes[-1]
+
+                current_parent_hash = parent_hash
+                for idx, (translated_hashes, translated_block_size) in enumerate(
+                    translated_groups
+                ):
+                    if not translated_hashes:
+                        continue
+                    translated.append(
+                        CacheStoreEvent(
+                            block_hashes=translated_hashes,
+                            parent_block_hash=current_parent_hash,
+                            token_ids=event.token_ids if idx == 0 else [],
+                            block_size=translated_block_size,
+                            lora_id=getattr(event, "lora_id", None),
+                            medium=event.medium,
+                            lora_name=getattr(event, "lora_name", None),
+                        )
                     )
-                )
+                    current_parent_hash = translated_hashes[-1]
             else:
-                translated.append(
-                    CacheEvictEvent(
-                        block_hashes=translated_hashes,
-                        block_size=translated_block_size,
-                        medium=event.medium,
+                for translated_hashes, translated_block_size in translated_groups:
+                    if not translated_hashes:
+                        continue
+                    translated.append(
+                        CacheEvictEvent(
+                            block_hashes=translated_hashes,
+                            block_size=translated_block_size,
+                            medium=event.medium,
+                        )
                     )
-                )
                 self._evict_hash_translation(event.block_hashes)
         return translated
 
