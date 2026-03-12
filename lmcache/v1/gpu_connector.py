@@ -42,6 +42,24 @@ class GPUConnectorTimingSink(metaclass=abc.ABCMeta):
         """Compute-stream stall interval caused by waiting on load_stream."""
         raise NotImplementedError
 
+    def record_store_copy_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
+        """GPU -> Host/CPU store copy interval (store_stream)."""
+        pass
+
+    def record_store_stall_interval(
+        self,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        layer_id: Optional[int] = None,
+    ):
+        """Compute-stream stall interval caused by waiting on store_stream."""
+        pass
+
 
 def _maybe_new_cuda_event(enable: bool) -> Optional["torch.cuda.Event"]:
     if not enable:
@@ -596,6 +614,17 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
 
             if layer_id > 0 and layer_id <= self.num_layers:
+                # Measure load-stream stall before the full device sync.
+                if emit:
+                    _cur = torch.cuda.current_stream()
+                    _ss = torch.cuda.Event(enable_timing=True)
+                    _se = torch.cuda.Event(enable_timing=True)
+                    _ss.record(_cur)
+                    _cur.wait_stream(self.load_stream)
+                    _se.record(_cur)
+                    self._timing_sink.record_stall_interval(
+                        _ss, _se, layer_id=layer_id - 1
+                    )
                 # NOTE: wait until both compute and load streams are done
                 torch.cuda.synchronize()
 
@@ -749,12 +778,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
+        emit = getattr(self, "_timing_sink", None) is not None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
+                _sc_start = _maybe_new_cuda_event(emit)
+                if _sc_start is not None:
+                    _sc_start.record(self.store_stream)
                 lmc_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
                     self.kvcaches[layer_id],
@@ -780,8 +813,23 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     )
                     if self.cache_positions:
                         memory_obj.metadata.old_positions = old_positions
+                if _sc_start is not None:
+                    _sc_end = torch.cuda.Event(enable_timing=True)
+                    _sc_end.record(self.store_stream)
+                    self._timing_sink.record_store_copy_interval(
+                        _sc_start, _sc_end, layer_id=layer_id
+                    )
 
             yield
+            if emit:
+                _ss = torch.cuda.Event(enable_timing=True)
+                _se = torch.cuda.Event(enable_timing=True)
+                _ss.record(current_stream)
+                current_stream.wait_stream(self.store_stream)
+                _se.record(current_stream)
+                self._timing_sink.record_store_stall_interval(
+                    _ss, _se, layer_id=layer_id
+                )
             self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
 
@@ -1047,6 +1095,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        self._maybe_update_timing_sink(**kwargs)
+
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -1090,12 +1140,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
+        emit = self._timing_sink is not None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
+                _sc_start = _maybe_new_cuda_event(emit)
+                if _sc_start is not None:
+                    _sc_start.record(self.store_stream)
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
@@ -1123,9 +1177,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             True,
                             self.vllm_two_major,
                         )
+                if _sc_start is not None:
+                    _sc_end = torch.cuda.Event(enable_timing=True)
+                    _sc_end.record(self.store_stream)
+                    self._timing_sink.record_store_copy_interval(
+                        _sc_start, _sc_end, layer_id=layer_id
+                    )
 
             yield
             if sync:
+                if emit:
+                    _ss = torch.cuda.Event(enable_timing=True)
+                    _se = torch.cuda.Event(enable_timing=True)
+                    _ss.record(current_stream)
+                    current_stream.wait_stream(self.store_stream)
+                    _se.record(current_stream)
+                    self._timing_sink.record_store_stall_interval(
+                        _ss, _se, layer_id=layer_id
+                    )
                 self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
 
