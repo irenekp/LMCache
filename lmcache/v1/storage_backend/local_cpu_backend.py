@@ -490,10 +490,28 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             # `batched_remove`. Therefore, features like usage tracking
                             # is not supported.
                             old_mem_objs = []
+                            missing_layer_keys = []
                             for key in evict_key_all_layer:
-                                old_mem_objs.append(self.hot_cache[key])
+                                mem_obj = self.hot_cache.get(key)
+                                if mem_obj is None:
+                                    missing_layer_keys.append(key)
+                                    continue
+                                old_mem_objs.append(mem_obj)
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
+
+                            if missing_layer_keys:
+                                logger.warning(
+                                    "Encountered partial layerwise eviction set for "
+                                    "chunk %s; cleaned up %d/%d resident layers and "
+                                    "skipped missing layers.",
+                                    evict_key.chunk_hash,
+                                    len(old_mem_objs),
+                                    len(evict_key_all_layer),
+                                )
+
+                            if not old_mem_objs:
+                                continue
 
                             self.memory_allocator.batched_free(old_mem_objs)
 

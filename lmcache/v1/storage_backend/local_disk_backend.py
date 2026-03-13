@@ -235,7 +235,15 @@ class LocalDiskBackend(StorageBackendInterface):
         # )
         # res.result()
 
-        os.remove(path)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            logger.warning(
+                "Local disk cache file for key %s was already missing at %s "
+                "during eviction; treating it as stale metadata.",
+                key,
+                path,
+            )
 
         if force:
             self.cache_policy.update_on_force_evict(key)
