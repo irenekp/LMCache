@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -954,6 +955,13 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        if self._timing_sink is not None:
+            record_guard_start = getattr(
+                self._timing_sink, "record_load_guard_start_ns", None
+            )
+            if callable(record_guard_start):
+                record_guard_start(time.perf_counter_ns())
+
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:

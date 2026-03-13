@@ -59,6 +59,7 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+_IO_FETCH_TIERS = frozenset({"LocalCPUBackend", "LocalDiskBackend", "GDSBackend"})
 
 
 class CacheEngineEndSignal:
@@ -199,6 +200,22 @@ class LMCacheEngine:
             return
         with self._kv_events_lock:
             self.kv_events.append(event)
+
+    def _record_io_fetch_ms(self, *, location: str, elapsed_ns: int) -> None:
+        if location not in _IO_FETCH_TIERS or elapsed_ns <= 0:
+            return
+        sink = getattr(self.gpu_connector, "_timing_sink", None)
+        if sink is None:
+            return
+        record_fn = getattr(sink, "record_io_fetch_ms", None)
+        if record_fn is None:
+            return
+        try:
+            record_fn(float(elapsed_ns) / 1e6)
+        except Exception:
+            logger.debug(
+                "Failed to record io fetch timing for location=%s.", location
+            )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1347,10 +1364,18 @@ class LMCacheEngine:
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
+            fetch_start_ns = (
+                time.perf_counter_ns() if location in _IO_FETCH_TIERS else None
+            )
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
             )
+            if fetch_start_ns is not None:
+                self._record_io_fetch_ms(
+                    location=location,
+                    elapsed_ns=time.perf_counter_ns() - fetch_start_ns,
+                )
             assert memory_objs is not None, (
                 "Failed to get memory objects from storage backend"
             )
